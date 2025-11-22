@@ -3,7 +3,7 @@ import './globals.css';
 import { Toaster } from "@/components/ui/toaster"
 
 export const metadata: Metadata = {
-  title: 'PrintEase',
+  title: 'Printel',
   description: 'Cloud-backed print shop system',
 };
 
