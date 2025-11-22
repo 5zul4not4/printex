@@ -1,4 +1,3 @@
-
 // src/lib/firebase/config.ts
 import { initializeApp, getApps, getApp, FirebaseApp } from "firebase/app";
 import { getFirestore, Firestore } from "firebase/firestore";
@@ -13,47 +12,38 @@ const firebaseConfig = {
   appId: process.env.NEXT_PUBLIC_FIREBASE_APP_ID,
 };
 
-// Server-side check for environment variables during build.
+// Server-side validation to ensure environment variables are set during build/deployment
 if (typeof window === 'undefined') {
-  for (const [key, value] of Object.entries(firebaseConfig)) {
-    if (!value) {
-      // This error will be caught by the Vercel build process
-      throw new Error(
-        `Firebase config error: The environment variable NEXT_PUBLIC_${key.replace(/([A-Z])/g, '_$1').toUpperCase()} is missing or empty. ` +
-        `Please add it to your Vercel project settings.`
-      );
+    for (const [key, value] of Object.entries(firebaseConfig)) {
+        if (!value) {
+            throw new Error(`Firebase configuration error: The environment variable ${key.replace(/([A-Z])/g, '_$1').toUpperCase()} is missing. Please add it to your .env.local file and Vercel project settings.`);
+        }
     }
-  }
 }
 
-// Client-side check for a better user-facing error.
+// Client-side check for a better user experience in case of misconfiguration
 if (typeof window !== 'undefined' && !firebaseConfig.projectId) {
-  alert(
-    'Firebase project ID is not defined in your environment variables. ' +
-    'The app will not work correctly. ' +
-    'Please ensure all NEXT_PUBLIC_FIREBASE_* variables are set in your Vercel project settings.'
-  );
+  // This will only run in the browser
+  // It uses a timeout to ensure the DOM is ready for an alert.
+  setTimeout(() => {
+    alert('Firebase configuration is missing. The app will not work correctly. Please check your environment variables.');
+  }, 500);
 }
+
 
 // Initialize Firebase App
 let app: FirebaseApp;
 if (getApps().length === 0) {
-  // Only initialize if the config is valid
-  if (firebaseConfig.projectId) {
-    app = initializeApp(firebaseConfig);
-  } else {
-    // Create a dummy app to avoid crashing the whole application
-    // This allows the error alert to be shown to the user
-    app = {} as FirebaseApp;
-    console.error("Firebase not initialized due to missing projectId.");
-  }
+    // If the project ID is missing on the client, we initialize with a dummy object
+    // to prevent the app from crashing outright. The alert above will inform the user.
+    app = initializeApp(firebaseConfig.projectId ? firebaseConfig : {});
 } else {
-  app = getApp();
+    app = getApp();
 }
 
 
-// Initialize services, checking if the app is valid before proceeding
-const db: Firestore = firebaseConfig.projectId ? getFirestore(app) : {} as Firestore;
-const storage: FirebaseStorage = firebaseConfig.projectId ? getStorage(app) : {} as FirebaseStorage;
+// Initialize services
+const db: Firestore = getFirestore(app);
+const storage: FirebaseStorage = getStorage(app);
 
 export { app, db, storage };
