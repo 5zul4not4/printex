@@ -1,0 +1,10 @@
+firebase-admin
+pywin32
+requests
+google-cloud-firestore
+Pillow
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
+PyPDF2
+python-docx
