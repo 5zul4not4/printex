@@ -12,7 +12,7 @@ export default function Home() {
       <header className="bg-card border-b">
         <div className="container mx-auto px-4 md:px-6 h-16 flex items-center">
           <Printer className="h-6 w-6 text-primary" />
-          <h1 className="ml-2 text-xl font-bold font-headline">PrintEase</h1>
+          <h1 className="ml-2 text-xl font-bold font-headline">Printel</h1>
         </div>
       </header>
 
