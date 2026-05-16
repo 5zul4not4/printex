@@ -1,3 +1,5 @@
+
+
 'use client';
 
 import { useEffect, useState } from 'react';
@@ -7,7 +9,7 @@ import { deleteAllPrintJobs, reprintJob } from '@/lib/firebase/actions';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { formatDistanceToNow } from 'date-fns';
-import { FileText, Loader2, AlertCircle, Trash2, Printer as PrinterIcon, Phone, RefreshCw, Search } from 'lucide-react';
+import { FileText, Loader2, AlertCircle, Trash2, Printer as PrinterIcon, Phone, RefreshCw, Search, CircleDollarSign } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { useToast } from '@/hooks/use-toast';
 import type { PrintJob, Printer } from '@/lib/types';
@@ -269,6 +271,7 @@ export default function AdminDashboard() {
 
   const getCombinedStatusBadge = (statuses: string[]) => {
     if (statuses.includes('error')) return { variant: 'destructive', label: 'Error' };
+    if (statuses.includes('pending-payment')) return { variant: 'destructive', label: 'Payment Pending', icon: <CircleDollarSign className="w-3 h-3 mr-1" /> };
     if (statuses.includes('reprint-completed')) return { variant: 'default', label: 'Reprint Done' };
     if (statuses.includes('printing')) return { variant: 'secondary', label: 'Printing' };
     if (statuses.includes('ready')) return { variant: 'outline', label: 'Ready' };
@@ -283,6 +286,7 @@ export default function AdminDashboard() {
       case 'printing': return 'secondary';
       case 'ready': case 'pending': return 'outline';
       case 'error': return 'destructive';
+      case 'pending-payment': return 'destructive';
       default: return 'secondary';
     }
   };
@@ -368,7 +372,7 @@ export default function AdminDashboard() {
                                             <p className="font-semibold text-lg">₹{order.totalCost.toFixed(2)}</p>
                                             <p className="text-xs text-muted-foreground">{formatDistanceToNow(new Date(order.createdAt), { addSuffix: true })}</p>
                                         </div>
-                                        <Badge variant={combinedStatus.variant} className="capitalize h-fit">{combinedStatus.label}</Badge>
+                                        <Badge variant={combinedStatus.variant} className="capitalize h-fit">{combinedStatus.icon}{combinedStatus.label}</Badge>
                                     </div>
                                 </div>
                                 <Separator className="my-3"/>
@@ -382,7 +386,7 @@ export default function AdminDashboard() {
                                                   <span className="font-semibold">{job.name}</span>
                                               </div>
                                               <div className="flex items-center gap-2">
-                                                <Badge variant={getStatusVariant(job.status)} className="capitalize">{job.status === 'reprint-completed' ? 'Reprint Done' : job.status}</Badge>
+                                                <Badge variant={getStatusVariant(job.status)} className="capitalize">{job.status.replace('-', ' ')}</Badge>
                                                 <ReprintDialog job={job} printers={printers} />
                                               </div>
                                           </div>

@@ -12,13 +12,35 @@ const firebaseConfig = {
   appId: process.env.NEXT_PUBLIC_FIREBASE_APP_ID,
 };
 
-// This check provides a clear error message during development if the config is missing.
-if (typeof window !== 'undefined' && !firebaseConfig.projectId) {
-  console.error('Firebase project ID is not defined in your environment variables. Check your .env.local file.');
+// Server-side validation to ensure environment variables are set during build/deployment
+if (typeof window === 'undefined') {
+    for (const [key, value] of Object.entries(firebaseConfig)) {
+        if (!value) {
+            throw new Error(`Firebase configuration error: The environment variable ${key.replace(/([A-Z])/g, '_$1').toUpperCase()} is missing. Please add it to your .env.local file and Vercel project settings.`);
+        }
+    }
 }
 
+// Client-side check for a better user experience in case of misconfiguration
+if (typeof window !== 'undefined' && !firebaseConfig.projectId) {
+  // This will only run in the browser
+  // It uses a timeout to ensure the DOM is ready for an alert.
+  setTimeout(() => {
+    alert('Firebase configuration is missing. The app will not work correctly. Please check your environment variables.');
+  }, 500);
+}
+
+
 // Initialize Firebase App
-const app: FirebaseApp = getApps().length ? getApp() : initializeApp(firebaseConfig);
+let app: FirebaseApp;
+if (getApps().length === 0) {
+    // If the project ID is missing on the client, we initialize with a dummy object
+    // to prevent the app from crashing outright. The alert above will inform the user.
+    app = initializeApp(firebaseConfig.projectId ? firebaseConfig : {});
+} else {
+    app = getApp();
+}
+
 
 // Initialize services
 const db: Firestore = getFirestore(app);

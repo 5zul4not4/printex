@@ -9,10 +9,7 @@ import datetime
 import subprocess
 import re
 import sys
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
-from googleapiclient.errors import HttpError
+import requests # For Telegram downloads
 import io
 try:
     from PyPDF2 import PdfReader, PdfWriter
@@ -27,9 +24,11 @@ FIREBASE_SERVICE_ACCOUNT_KEY_PATH = 'serviceAccountKey.json'
 TEMP_DIR = "printed_jobs"
 PRINTER_REFRESH_INTERVAL = 20 # seconds
 
-DRIVE_SERVICE_ACCOUNT_KEY_PATH = 'driveServiceAccountKey.json'
-DRIVE_SCOPES = ['https://www.googleapis.com/auth/drive']
-DRIVE_FOLDER_ID = '0AAg0HgehhXVRUk9PVA' # Replace with your Google Drive Folder ID
+# --- TELEGRAM CREDENTIALS ---
+# IMPORTANT: Replace these placeholder values with your actual credentials.
+TELEGRAM_BOT_TOKEN = "8384966768:AAHgEWSUd-tpLy7nMpzUsxkJ7D13E4FpuXU"
+TELEGRAM_CHAT_ID = "-1003690901983"
+# ----------------------------
 
 # A4 paper size in inches for layout calculations
 A4_WIDTH_IN = 8.27
@@ -46,17 +45,6 @@ try:
 except Exception as e:
     print(f"❌ Error initializing Firebase: {e}")
     sys.exit(1)
-
-drive_service = None
-try:
-    drive_creds = service_account.Credentials.from_service_account_file(
-        DRIVE_SERVICE_ACCOUNT_KEY_PATH, scopes=DRIVE_SCOPES)
-    drive_service = build('drive', 'v3', credentials=drive_creds)
-    print("✅ Google Drive service initialized successfully.")
-except FileNotFoundError:
-    print(f"⚠️ WARNING: Google Drive service account key not found at '{DRIVE_SERVICE_ACCOUNT_KEY_PATH}'. File operations will fail.")
-except Exception as e:
-    print(f"❌ Error initializing Google Drive service: {e}")
 
 
 # === GLOBALS ===
@@ -131,97 +119,139 @@ def update_printers_in_firestore():
         print(f"⚠️ Could not update printers in Firestore: {e}")
 
 # === FILE PROCESSING & PRINTING ===
-def download_file_from_drive(file_id, local_path):
-    """Downloads a file from Google Drive using its file ID."""
-    if not drive_service:
-        raise Exception("Google Drive service not available for download.")
+def download_file(file_id, local_path):
+    """Downloads a file from Telegram using its file_id."""
+    if not TELEGRAM_BOT_TOKEN:
+        raise Exception("Telegram Bot Token not configured for download.")
+    
     try:
-        # First, get file metadata to ensure it exists and we have permissions.
-        # This can help stabilize the connection before the download begins.
-        print(f"⬇️  Verifying Google Drive file (ID: {file_id})...")
-        drive_service.files().get(fileId=file_id, supportsAllDrives=True).execute()
+        print(f"⬇️  Requesting file path from Telegram for file_id: {file_id}")
         
-        print(f"⬇️  Downloading from Google Drive...")
-        request = drive_service.files().get_media(fileId=file_id, supportsAllDrives=True)
-        fh = io.FileIO(local_path, 'wb')
-        downloader = MediaIoBaseDownload(fh, request)
+        # 1. Get the file path from the file_id
+        get_file_path_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile"
+        response = requests.get(get_file_path_url, params={'file_id': file_id})
+        response.raise_for_status()
         
-        done = False
-        while not done:
-            status, done = downloader.next_chunk()
-            if status:
-                print(f"   Download {int(status.progress() * 100)}%.")
+        file_path_data = response.json()
+        if not file_path_data.get('ok'):
+            raise Exception(f"Telegram getFile failed: {file_path_data.get('description', 'Unknown error')}")
+            
+        file_path_on_server = file_path_data['result']['file_path']
         
+        # 2. Download the file using the path
+        download_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path_on_server}"
+        print(f"⬇️  Downloading from Telegram...")
+        
+        with requests.get(download_url, stream=True) as r:
+            r.raise_for_status()
+            with open(local_path, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+
         print(f"✅ File downloaded successfully to '{os.path.basename(local_path)}'")
         return local_path
         
-    except HttpError as error:
-        if error.resp.status == 404:
-             raise Exception(f"File not found in Google Drive (ID: {file_id}). It may have been deleted or the ID is incorrect.")
-        raise Exception(f"Google Drive API error: {error}")
+    except requests.exceptions.RequestException as e:
+        raise Exception(f"Network error during Telegram download: {e}")
     except Exception as e:
-        # This will catch other errors, including potential WinError exceptions
-        raise Exception(f"Failed during file download: {e}")
+        raise Exception(f"Failed during file download from Telegram: {e}")
 
 
-def create_image_layout_pdf(image_path, copies, layout_info, print_type, orientation, output_pdf_path):
-    """Creates a PDF with multiple copies of a single image on one or more pages."""
+def create_image_layout_pdf(image_paths, copies, layout_info, print_type, orientation_choice, output_pdf_path):
+    """Creates a PDF with multiple images, respecting auto-orientation."""
     layout_type = layout_info.get('type', 'full-page')
     fit_mode = layout_info.get('fit', 'contain')
     
-    print(f"🎨 Creating collage '{layout_type}' for {copies} copies of one photo...")
+    print(f"🎨 Creating collage '{layout_type}' for {len(image_paths)} photos...")
 
     try:
-        if orientation == 'landscape':
-            a4_pixel_width, a4_pixel_height = int(A4_HEIGHT_IN * DPI), int(A4_WIDTH_IN * DPI)
+        # Determine final orientation
+        final_orientation = orientation_choice
+        if final_orientation == 'auto':
+            # For auto, base orientation on the first image
+            first_image = Image.open(image_paths[0])
+            final_orientation = 'landscape' if first_image.width > first_image.height else 'portrait'
+            print(f"   Auto-detected orientation as '{final_orientation}'")
+
+        if final_orientation == 'landscape':
+            page_pixel_width, page_pixel_height = int(A4_HEIGHT_IN * DPI), int(A4_WIDTH_IN * DPI)
         else: # Portrait
-            a4_pixel_width, a4_pixel_height = int(A4_WIDTH_IN * DPI), int(A4_HEIGHT_IN * DPI)
+            page_pixel_width, page_pixel_height = int(A4_WIDTH_IN * DPI), int(A4_HEIGHT_IN * DPI)
 
         grid_cols, grid_rows = 1, 1
-        if layout_type == '2-up': grid_cols, grid_rows = (2, 1) if orientation == 'landscape' else (1, 2)
+        if layout_type == '2-up': grid_cols, grid_rows = (2, 1) if final_orientation == 'landscape' else (1, 2)
         elif layout_type == '4-up': grid_cols, grid_rows = 2, 2
         elif layout_type == '9-up': grid_cols, grid_rows = 3, 3
-        elif layout_type == 'contact-sheet': grid_cols, grid_rows = (7, 5) if orientation == 'landscape' else (5, 7)
+        elif layout_type == 'contact-sheet': grid_cols, grid_rows = (7, 5) if final_orientation == 'landscape' else (5, 7)
         
         photos_per_page = grid_cols * grid_rows
-        total_pages_needed = (copies + photos_per_page - 1) // photos_per_page # Ceiling division
+        total_images_to_place = len(image_paths) * copies
+        total_pages_needed = (total_images_to_place + photos_per_page - 1) // photos_per_page
 
-        cell_width = a4_pixel_width // grid_cols
-        cell_height = a4_pixel_height // grid_rows
-
-        source_image = Image.open(image_path)
-        if print_type == 'bw':
-            source_image = source_image.convert('L').convert('RGB')
+        cell_width = page_pixel_width // grid_cols
+        cell_height = page_pixel_height // grid_rows
         
-        # Resize the source image to fit the cell once
-        resized_image = source_image.copy()
-        if fit_mode == 'contain':
-            resized_image.thumbnail((cell_width, cell_height), Image.Resampling.LANCZOS)
-        else: # 'cover'
-            img_aspect, cell_aspect = resized_image.width / resized_image.height, cell_width / cell_height
-            if img_aspect > cell_aspect:
-                new_height, new_width = cell_height, int(cell_height * img_aspect)
-            else:
-                new_width, new_height = cell_width, int(cell_width / img_aspect)
-            resized_image = resized_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
-            left, top = (new_width - cell_width) / 2, (new_height - cell_height) / 2
-            resized_image = resized_image.crop((left, top, left + cell_width, top + cell_height))
-
         pdf_pages = []
-        copies_placed = 0
         
+        source_images = []
+        for image_path in image_paths:
+            source_image = Image.open(image_path)
+
+            if print_type == 'bw':
+                source_image = source_image.convert('L').convert('RGB')
+            else:
+                source_image = source_image.convert('RGB')
+
+            img_w, img_h = source_image.size
+            cell_w, cell_h = cell_width, cell_height
+            img_ratio = img_w / img_h
+            cell_ratio = cell_w / cell_h
+
+            if fit_mode == 'contain':
+                if img_ratio > cell_ratio:
+                    new_w = cell_w
+                    new_h = int(new_w / img_ratio)
+                else:
+                    new_h = cell_h
+                    new_w = int(new_h * img_ratio)
+
+                resized = source_image.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                canvas = Image.new('RGB', (cell_w, cell_h), 'white')
+                paste_x = (cell_w - new_w) // 2
+                paste_y = (cell_h - new_h) // 2
+                canvas.paste(resized, (paste_x, paste_y))
+                final_image_for_cell = canvas
+            else: # Cover mode
+                if img_ratio > cell_ratio:
+                    new_h = cell_h
+                    new_w = int(new_h * img_ratio)
+                else:
+                    new_w = cell_w
+                    new_h = int(new_w / img_ratio)
+
+                resized = source_image.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                crop_x = (new_w - cell_w) // 2
+                crop_y = (new_h - cell_h) // 2
+                final_image_for_cell = resized.crop((crop_x, crop_y, crop_x + cell_w, crop_y + cell_h))
+
+            source_images.append(final_image_for_cell)
+
+        image_iterator = 0
         for _ in range(total_pages_needed):
-            page_canvas = Image.new('RGB', (a4_pixel_width, a4_pixel_height), 'white')
+            page_canvas = Image.new('RGB', (page_pixel_width, page_pixel_height), 'white')
             
             for i in range(photos_per_page):
-                if copies_placed >= copies:
+                if image_iterator >= total_images_to_place:
                     break
                 
-                row, col = (i // grid_cols), (i % grid_cols)
-                paste_x = col * cell_width + (cell_width - resized_image.width) // 2
-                paste_y = row * cell_height + (cell_height - resized_image.height) // 2
-                page_canvas.paste(resized_image, (paste_x, paste_y))
-                copies_placed += 1
+                current_image_index = (image_iterator // copies) % len(source_images)
+                image_to_paste = source_images[current_image_index]
+                
+                row, col = (i // grid_rows), (i % grid_rows)
+                paste_x = col * cell_width
+                paste_y = row * cell_height
+                page_canvas.paste(image_to_paste, (paste_x, paste_y))
+                image_iterator += 1
             
             pdf_pages.append(page_canvas)
 
@@ -235,7 +265,7 @@ def create_image_layout_pdf(image_path, copies, layout_info, print_type, orienta
 
 
 def convert_to_pdf(input_path, word_app):
-    """Converts various file types to PDF. A word_app instance must be provided for doc/docx/txt."""
+    """Converts document file types to PDF. A word_app instance must be provided for doc/docx/txt."""
     file_ext = os.path.splitext(input_path)[1].lower()
     output_path = os.path.splitext(input_path)[0] + "_converted.pdf"
 
@@ -255,23 +285,9 @@ def convert_to_pdf(input_path, word_app):
             print("✅ Document to PDF conversion successful.")
         
         elif file_ext in ['.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff']:
-            print(f"🖼️  Converting image to PDF: {os.path.basename(input_path)}")
-            image = Image.open(input_path)
-            # Create a new blank A4 page and paste the image onto it
-            a4_pixel_width = int(A4_WIDTH_IN * DPI)
-            a4_pixel_height = int(A4_HEIGHT_IN * DPI)
-            
-            # If image is larger than A4, scale it down to fit
-            image.thumbnail((a4_pixel_width, a4_pixel_height), Image.Resampling.LANCZOS)
-            
-            a4_page = Image.new('RGB', (a4_pixel_width, a4_pixel_height), 'white')
-            # Center the image on the page
-            paste_x = (a4_pixel_width - image.width) // 2
-            paste_y = (a4_pixel_height - image.height) // 2
-            a4_page.paste(image, (paste_x, paste_y))
-            
-            a4_page.save(output_path, "PDF", resolution=DPI)
-            print("✅ Image to PDF conversion successful.")
+            # This logic is now handled by create_image_layout_pdf to respect user settings.
+            # This function will no longer process single images directly.
+            raise Exception(f"Single image file '{os.path.basename(input_path)}' should be processed as an image group.")
         
         else:
             raise Exception(f"Unsupported file type for conversion: {file_ext}")
@@ -384,14 +400,18 @@ def process_page_count_request(job_id, job_data):
 
     try:
         pythoncom.CoInitialize() # Initialize COM for this thread
-        drive_file_id = job_data.get('googleDriveFileId')
-        unique_file_name = job_data.get('fileName') 
+        file_id = job_data.get('googleDriveFileId') # Re-using this field for Telegram file_id
         
-        if not drive_file_id:
-            raise Exception("Missing Google Drive File ID in page count request.")
+        if not file_id:
+            raise Exception("Missing File ID in page count request.")
 
-        local_file_path = os.path.join(TEMP_DIR, f"{job_id}_{unique_file_name}")
-        download_file_from_drive(drive_file_id, local_file_path)
+        # Construct a temporary filename using the job ID and original file name
+        original_file_name = job_data.get('fileName')
+        if not original_file_name:
+            raise Exception("Missing original file name in page count request.")
+            
+        local_file_path = os.path.join(TEMP_DIR, f"{job_id}_{original_file_name}")
+        download_file(file_id, local_file_path)
 
         word = win32com.client.Dispatch("Word.Application")
         word.Visible = False
@@ -440,7 +460,7 @@ def process_print_job(job_id, job_data):
             temp_files_to_clean.append(cover_page_text_path)
             
             with open(cover_page_text_path, 'w', encoding='utf-8') as f:
-                f.write("========= PrintEase Order Summary =========\n\n")
+                f.write("========= PrintEx Order Summary =========\n\n")
                 f.write(f"Order ID: {job_data.get('orderId', 'N/A')}\n")
                 f.write(f"Customer Name: {job_data.get('username', 'N/A')}\n")
                 f.write(f"Date: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n")
@@ -472,46 +492,50 @@ def process_print_job(job_id, job_data):
             file_specific_temp_files = []
             try:
                 original_file_name = file_info.get('originalFileName', f'file_{i+1}')
-                is_image = file_info.get('isImageFile', False)
+                is_group = file_info.get('isGroup', False)
                 print(f"\n📄 Processing file {i+1}/{len(files_to_process)}: {original_file_name}")
 
-                drive_file_id = file_info.get('googleDriveFileId')
-                if not drive_file_id: raise Exception(f"Missing Google Drive ID for file '{original_file_name}'.")
-
-                local_path = os.path.join(TEMP_DIR, f"{job_id}_{i}_{original_file_name}")
-                file_specific_temp_files.append(local_path)
-                download_file_from_drive(drive_file_id, local_path)
-                
                 final_pdf_for_this_file = None
                 desired_orientation = file_info.get('orientation', 'portrait')
                 copies = file_info.get('copies', 1)
                 
-                if is_image:
-                    layout_info = file_info.get('imageLayout')
-                    layout_type = layout_info.get('type', 'full-page') if layout_info else 'full-page'
-                    
-                    if layout_type == 'full-page':
-                        # For full-page, just convert the single image to a PDF. The copies will be handled by the print command.
-                        converted_pdf = convert_to_pdf(local_path, word_app=word)
-                        if converted_pdf != local_path: file_specific_temp_files.append(converted_pdf)
-                        final_pdf_for_this_file = converted_pdf
-                    else:
-                        # For collages, create a PDF with the specified number of image copies laid out on pages.
-                        collage_pdf_path = os.path.join(TEMP_DIR, f"{job_id}_collage_{i}.pdf")
-                        file_specific_temp_files.append(collage_pdf_path)
+                if is_group:
+                    image_files_data = file_info.get('imageFiles', [])
+                    if not image_files_data: raise Exception(f"Missing imageFiles data for collage '{original_file_name}'.")
+
+                    image_paths = []
+                    for img_idx, img_data in enumerate(image_files_data):
+                        img_file_id = img_data.get('googleDriveFileId') # Re-using field for Telegram file_id
+                        if not img_file_id: raise Exception(f"Missing File ID for an image in collage.")
                         
-                        create_image_layout_pdf(
-                            image_path=local_path,
-                            copies=copies,
-                            layout_info=layout_info,
-                            print_type=file_info.get('printType'),
-                            orientation=desired_orientation,
-                            output_pdf_path=collage_pdf_path
-                        )
-                        final_pdf_for_this_file = collage_pdf_path
-                        # For collages, the PDF itself contains all copies, so the printer should only print it once.
-                        copies = 1 
+                        img_original_name = img_data.get('originalFileName', f"image_{img_idx}.jpg")
+                        img_local_path = os.path.join(TEMP_DIR, f"{job_id}_{i}_img_{img_idx}_{img_original_name}")
+                        file_specific_temp_files.append(img_local_path)
+                        download_file(img_file_id, img_local_path)
+                        image_paths.append(img_local_path)
+
+                    layout_info = file_info.get('imageLayout')
+                    collage_pdf_path = os.path.join(TEMP_DIR, f"{job_id}_collage_{i}.pdf")
+                    file_specific_temp_files.append(collage_pdf_path)
+                    
+                    create_image_layout_pdf(
+                        image_paths=image_paths,
+                        copies=copies,
+                        layout_info=layout_info,
+                        print_type=file_info.get('printType'),
+                        orientation_choice=desired_orientation,
+                        output_pdf_path=collage_pdf_path
+                    )
+                    final_pdf_for_this_file = collage_pdf_path
+                    copies = 1 
                 else: # Document file
+                    file_id = file_info.get('googleDriveFileId') # Re-using field for Telegram file_id
+                    if not file_id: raise Exception(f"Missing File ID for file '{original_file_name}'.")
+
+                    local_path = os.path.join(TEMP_DIR, f"{job_id}_{i}_{original_file_name}")
+                    file_specific_temp_files.append(local_path)
+                    download_file(file_id, local_path)
+                    
                     converted_pdf_path = convert_to_pdf(local_path, word_app=word)
                     if converted_pdf_path != local_path: file_specific_temp_files.append(converted_pdf_path)
 
@@ -563,13 +587,20 @@ def process_print_job(job_id, job_data):
                     else:
                         final_pdf_for_this_file = rotated_pdf_path_for_doc
 
+                # For image groups, the final orientation is determined inside create_image_layout_pdf
+                final_print_orientation = desired_orientation
+                if is_group and desired_orientation == 'auto':
+                    # Re-check orientation for the final print command
+                    first_image = Image.open(image_paths[0])
+                    final_print_orientation = 'landscape' if first_image.width > first_image.height else 'portrait'
+
                 print_file(
                     printer_name=job_data.get('name'),
                     file_path=final_pdf_for_this_file,
                     job_id=f"{job_id}-{i+1}",
                     copies=copies,
                     duplex_mode=file_info.get('duplex', 'one-sided'),
-                    orientation=desired_orientation,
+                    orientation=final_print_orientation,
                     paper_size=file_info.get('paperSize', 'A4')
                 )
             
@@ -606,7 +637,7 @@ def create_test_page_file(job_id, printer_name):
     """Creates a text file for a test print job."""
     local_path = os.path.join(TEMP_DIR, f"{job_id}_test_page.txt")
     with open(local_path, 'w', encoding='utf-8') as f:
-        f.write(f"--- PrintEase Test Page ---\n\nJob ID: {job_id}\nPrinter: {printer_name}\nTimestamp: {datetime.datetime.now()}\n\n✅ This is a test print from the PrintEase Local Connector.\n")
+        f.write(f"--- PrintEx Test Page ---\n\nJob ID: {job_id}\nPrinter: {printer_name}\nTimestamp: {datetime.datetime.now()}\n\n✅ This is a test print from the PrintEx Local Connector.\n")
     return local_path
 
 def process_test_job(job_id, job_data):
@@ -676,15 +707,21 @@ def start_job_listener():
 
 # === MAIN ===
 def main():
-    print("--- PrintEase Local Connector ---")
+    print("--- PrintEx Local Connector ---")
     os.makedirs(TEMP_DIR, exist_ok=True)
+    
+    if not TELEGRAM_BOT_TOKEN or "YOUR_TELEGRAM_BOT_TOKEN" in TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("❌ Critical: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is not set in the script.")
+        print("   Please edit the local_connector.py file and set the required credential variables.")
+        sys.exit(1)
+    else:
+        print("✅ Telegram credentials loaded from script.")
 
     try:
         from PIL import Image
         import win32com.client
-        from googleapiclient.discovery import build
     except ImportError as e:
-        print(f"❌ Missing required library: {e.name}. Please run:\npip install Pillow pypiwin32 google-api-python-client PyPDF2")
+        print(f"❌ Missing required library: {e.name}. Please run:\npip install Pillow pypiwin32 PyPDF2 requests")
         sys.exit(1)
 
     update_printers_in_firestore()
@@ -712,5 +749,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

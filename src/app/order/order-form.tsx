@@ -1,4 +1,5 @@
 
+
 'use client';
 
 import { useState, useCallback, useMemo, useEffect, useRef } from 'react';
@@ -9,11 +10,11 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group';
 import { Progress } from '@/components/ui/progress';
-import { ArrowLeft, ArrowRight, Check, CheckCircle, FileUp, FlipHorizontal, FlipVertical, Image as ImageIcon, Loader2, Minus, Palette, Phone, Plus, Printer as PrinterIcon, RefreshCw, Trash2, User, XCircle } from 'lucide-react';
+import { ArrowLeft, ArrowRight, Check, CheckCircle, ChevronLeft, ChevronRight, FileUp, FlipHorizontal, FlipVertical, Image as ImageIcon, Loader2, Minus, Palette, Phone, Plus, Printer as PrinterIcon, RefreshCw, Trash2, User, XCircle, PlusCircle, Settings2 } from 'lucide-react';
 import { useToast } from '@/hooks/use-toast';
-import type { PrintJob, Printer, Pricing, FileInJob, ImageLayout } from '@/lib/types';
-import { createPrintJob, getGoogleDriveUploadUrl, getPageCountForWordFile, createRazorpayOrder, verifyRazorpayPayment, updatePrintJobsWithPayment, getDriveFileIdByName } from '@/lib/firebase/actions';
-import { getPricing } from '@/lib/firebase/actions';
+import type { PrintJob, Printer, Pricing, FileInJob, ImageLayout, ImageFile } from '@/lib/types';
+import { getPageCountForWordFile, createPrintJob } from '@/lib/firebase/actions';
+import { getPricing, createRazorpayOrder, verifyRazorpayPayment, updatePrintJobsWithPayment, getTelegramUploadUrl } from '@/lib/firebase/actions';
 import { parsePageRanges } from '@/lib/utils';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Checkbox } from '@/components/ui/checkbox';
@@ -25,38 +26,55 @@ import { Separator } from '@/components/ui/separator';
 import { cn } from '@/lib/utils';
 import Image from 'next/image';
 
-interface FileDetails {
+interface SubFileDetails {
     id: string;
     originalFile: File;
-    previewUrl?: string; // For image previews or data URIs
-    uniqueFileName: string | null;
-    googleDriveFileId: string | null;
-    jobId?: string; // Firestore job ID for page count requests
+    previewUrl?: string;
+    googleDriveFileId: string | null; // Re-using this field for Telegram file_id
+    status: 'pending' | 'uploading' | 'complete' | 'error';
+    progress: number;
+    message?: string;
+}
+
+interface FileDetails {
+    id: string;
+    isGroup: boolean; // Is this a single file or a group of images?
+    
+    // Single file properties
+    originalFile?: File; 
+    jobId?: string; // For page count requests
     pageCount: number | null;
     isWordFile: boolean;
     isImageFile: boolean;
+    pageRange: string;
+    
+    // Group properties
+    imageFiles: SubFileDetails[];
+    
+    // Shared properties
     printType: 'bw' | 'color';
     copies: number;
-    pageRange: string;
     duplex: FileInJob['duplex'];
     paperSize: FileInJob['paperSize'];
     imageLayout: ImageLayout;
     orientation: FileInJob['orientation'];
     cost: number;
-    status: 'pending' | 'uploading' | 'getting_id' | 'counting_pages' | 'ready_for_config' | 'processing' | 'complete' | 'error';
-    progress: number;
+    status: 'pending' | 'uploading' | 'counting_pages' | 'ready_for_config' | 'processing' | 'complete' | 'error';
+    progress: number; // For single files or average for groups
     message?: string;
+    googleDriveFileId: string | null; // Re-using this field for Telegram file_id
 }
+
 
 const paperSizes: FileInJob['paperSize'][] = ['A4', 'A3', 'A2', 'A1', 'A0'];
 const isLargeFormat = (paperSize?: FileInJob['paperSize']) => paperSize === 'A2' || paperSize === 'A1' || paperSize === 'A0';
 
-const layoutOptions: { value: ImageLayout['type']; label: string; photosPerPage: number, grid: [number, number] }[] = [
-  { value: 'full-page', label: 'Full Page (1)', photosPerPage: 1, grid: [1, 1] },
-  { value: '2-up', label: '10 x 15 cm (2)', photosPerPage: 2, grid: [1, 2] },
-  { value: '4-up', label: '9 x 13 cm (4)', photosPerPage: 4, grid: [2, 2] },
-  { value: '9-up', label: 'Wallet (9)', photosPerPage: 9, grid: [3, 3] },
-  { value: 'contact-sheet', label: 'Contact Sheet (35)', photosPerPage: 35, grid: [5, 7] },
+const layoutOptions: { value: ImageLayout['type']; label: string; subtitle: string; photosPerPage: number, grid: [number, number] }[] = [
+  { value: 'full-page', label: 'Full Page', subtitle: '1 photo per page', photosPerPage: 1, grid: [1, 1] },
+  { value: '2-up', label: '2 per Page', subtitle: '~prints 2-up', photosPerPage: 2, grid: [1, 2] },
+  { value: '4-up', label: '4 per Page', subtitle: '~prints 4-up', photosPerPage: 4, grid: [2, 2] },
+  { value: '9-up', label: '9 per Page', subtitle: 'Wallet size', photosPerPage: 9, grid: [3, 3] },
+  { value: 'contact-sheet', label: 'Contact Sheet', subtitle: '35 per page', photosPerPage: 35, grid: [5, 7] },
 ];
 
 
@@ -66,23 +84,20 @@ interface OrderFormProps {
     setStep: (step: number) => void;
 }
 
-// Helper to manage round-robin counters.
-const printerCategoryRotation = new Map<string, number>();
-function getNextPrinterIndex(category: string, totalPrinters: number): number {
-    if (totalPrinters === 0) return 0;
-    const currentIndex = printerCategoryRotation.get(category) || 0;
-    const nextIndex = (currentIndex + 1) % totalPrinters;
-    printerCategoryRotation.set(category, nextIndex);
-    return currentIndex;
-}
+// Global counter for user-based round-robin.
+let userOrderCounter = 0;
+
 function getFileCategory(file: FileInJob | FileDetails): string {
-    return `${file.printType}-${file.paperSize}`;
+    const paperSize = file.isGroup ? file.paperSize : file.paperSize;
+    const printType = file.isGroup ? file.printType : file.printType;
+    return `${printType}-${paperSize}`;
 }
 
 
 export function OrderForm({ initialPrinters, currentStep, setStep }: OrderFormProps) {
   const { toast } = useToast();
   const [isRazorpayReady, setIsRazorpayReady] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const [files, setFiles] = useState<FileDetails[]>([]);
   const [binding, setBinding] = useState<'none' | 'spiral' | 'soft'>('none');
@@ -93,6 +108,7 @@ export function OrderForm({ initialPrinters, currentStep, setStep }: OrderFormPr
   const [pricing, setPricing] = useState<Pricing | null>(null);
   const [printers, setPrinters] = useState<Printer[]>(initialPrinters);
   const [phoneNumber, setPhoneNumber] = useState('');
+  const [previewPages, setPreviewPages] = useState<Record<string, number>>({});
 
   // Use refs to store rotation indices to persist them across re-renders without causing re-renders themselves
   const rotationIndices = useRef(new Map<string, number>());
@@ -110,6 +126,7 @@ export function OrderForm({ initialPrinters, currentStep, setStep }: OrderFormPr
     const currentIndex = rotationIndices.current.get(category) || 0;
     const nextIndex = (currentIndex + 1) % count;
     rotationIndices.current.set(category, nextIndex);
+    return;
   };
 
 
@@ -125,7 +142,7 @@ export function OrderForm({ initialPrinters, currentStep, setStep }: OrderFormPr
     loadPricing();
   }, []);
   
-  const updateFileDetails = (id: string, newDetails: Partial<Omit<FileDetails, 'id' | 'originalFile'>>) => {
+  const updateFileDetails = (id: string, newDetails: Partial<Omit<FileDetails, 'id'>>) => {
     setFiles(currentFiles =>
       currentFiles.map(f => {
         if (f.id === id) {
@@ -138,12 +155,59 @@ export function OrderForm({ initialPrinters, currentStep, setStep }: OrderFormPr
               updatedFile.imageLayout.photosPerPage = layoutOption.photosPerPage;
             }
           }
+           // Update main status based on children statuses
+            if (updatedFile.isGroup) {
+                const statuses = updatedFile.imageFiles.map(sf => sf.status);
+                if (statuses.some(s => s === 'error')) updatedFile.status = 'error';
+                else if (statuses.every(s => s === 'complete')) {
+                    updatedFile.status = 'ready_for_config';
+                    updatedFile.message = 'Ready to configure.';
+                }
+                else if (statuses.some(s => s === 'uploading')) updatedFile.status = 'uploading';
+                else updatedFile.status = 'pending';
+                
+                const totalProgress = updatedFile.imageFiles.reduce((acc, sf) => acc + sf.progress, 0);
+                updatedFile.progress = updatedFile.imageFiles.length > 0 ? totalProgress / updatedFile.imageFiles.length : 0;
+            }
+
           return updatedFile;
         }
         return f;
       })
     );
   };
+   const updateSubFileDetails = (groupId: string, subFileId: string, newDetails: Partial<SubFileDetails>) => {
+        setFiles(currentFiles => 
+            currentFiles.map(group => {
+                if (group.id === groupId && group.isGroup) {
+                    const newImageFiles = group.imageFiles.map(subFile => 
+                        subFile.id === subFileId ? { ...subFile, ...newDetails } : subFile
+                    );
+                    
+                    const updatedGroup = { ...group, imageFiles: newImageFiles };
+
+                    // After updating the sub-file, check the status of the entire group
+                    const statuses = newImageFiles.map(sf => sf.status);
+                    if (statuses.some(s => s === 'error')) {
+                        updatedGroup.status = 'error';
+                    } else if (statuses.every(s => s === 'complete')) {
+                        updatedGroup.status = 'ready_for_config';
+                        updatedGroup.message = 'Ready to configure.';
+                    } else if (statuses.some(s => s === 'uploading')) {
+                        updatedGroup.status = 'uploading';
+                    } else {
+                        updatedGroup.status = 'pending';
+                    }
+
+                    const totalProgress = newImageFiles.reduce((acc, sf) => acc + sf.progress, 0);
+                    updatedGroup.progress = newImageFiles.length > 0 ? totalProgress / newImageFiles.length : 0;
+                    
+                    return updatedGroup;
+                }
+                return group;
+            })
+        );
+    };
   
   useEffect(() => {
     if (!pricing) return;
@@ -155,28 +219,25 @@ export function OrderForm({ initialPrinters, currentStep, setStep }: OrderFormPr
       let fileCost = 0;
       
       if (currentFile.isImageFile) {
-        const layout = layoutOptions.find(l => l.value === currentFile.imageLayout.type);
-        const photosPerPage = layout?.photosPerPage || 1;
+          const layout = layoutOptions.find(l => l.value === currentFile.imageLayout.type);
+          const photosPerPage = layout?.photosPerPage || 1;
+          const imageCount = currentFile.isGroup ? currentFile.imageFiles.length : 1;
+          
+          if (currentFile.imageLayout.type === 'contact-sheet') {
+              // Price per image for contact sheets
+              fileCost = imageCount * 10 * currentFile.copies;
+          } else {
+              // Price per sheet for other layouts
+              const sheetsNeeded = Math.ceil((imageCount * currentFile.copies) / photosPerPage);
+              let sheetCost = 0;
 
-        let sheetCost = 0;
-        if (isLargeFormat(currentFile.paperSize)) {
-            const size = currentFile.paperSize;
-            if (size === 'A2') sheetCost = currentFile.printType === 'bw' ? pricing.bwA2Price : pricing.colorA2Price;
-            else if (size === 'A1') sheetCost = currentFile.printType === 'bw' ? pricing.bwA1Price : pricing.colorA1Price;
-            else if (size === 'A0') sheetCost = currentFile.printType === 'bw' ? pricing.bwA0Price : pricing.colorA0Price;
-        } else if (currentFile.paperSize === 'A3') {
-            sheetCost = currentFile.printType === 'bw' ? pricing.bwA3Price : pricing.colorA3Price;
-        } else { // A4
-            sheetCost = currentFile.printType === 'bw' ? pricing.bwA4After10Price : pricing.colorA4Price; // Use after 10 price as a base for simplicity in collage
-        }
-        
-        if (currentFile.imageLayout.type === 'full-page') {
-            fileCost = sheetCost * currentFile.copies;
-        } else {
-            const sheetsNeeded = Math.ceil(currentFile.copies / photosPerPage);
-            fileCost = sheetCost * sheetsNeeded;
-        }
-
+              if (currentFile.printType === 'bw') {
+                  sheetCost = 2; // 2 Rs for B/W sheet
+              } else {
+                  sheetCost = 10; // 10 Rs for Color sheet
+              }
+              fileCost = sheetsNeeded * sheetCost;
+          }
       } else { // Document file
         let pagesToPrint = parsePageRanges(currentFile.pageRange, currentFile.pageCount ?? 0).length || (currentFile.pageCount ?? 0);
         if (pagesToPrint === 0 && currentFile.pageCount && currentFile.pageCount > 0) pagesToPrint = currentFile.pageCount;
@@ -213,13 +274,13 @@ export function OrderForm({ initialPrinters, currentStep, setStep }: OrderFormPr
     }
 
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [JSON.stringify(files.map(f => `${f.id}-${f.status}-${f.pageRange}-${f.copies}-${f.printType}-${f.duplex}-${f.paperSize}-${f.imageLayout.type}`)), pricing]);
+  }, [JSON.stringify(files.map(f => `${f.id}-${f.status}-${f.pageRange}-${f.copies}-${f.printType}-${f.duplex}-${f.paperSize}-${f.imageLayout.type}-${f.isGroup ? f.imageFiles.length : 1}`)), pricing]);
 
-  const handleWordPageCount = async (fileId: string, googleDriveFileId: string, uniqueFileName: string) => {
+  const handleWordPageCount = async (fileId: string, telegramFileId: string, originalFileName: string) => {
     let unsubscribe: (() => void) | null = null;
     try {
         updateFileDetails(fileId, { status: 'counting_pages', message: 'Requesting page count...' });
-        const result = await getPageCountForWordFile(googleDriveFileId, uniqueFileName);
+        const result = await getPageCountForWordFile(telegramFileId, originalFileName);
         if (!result.success || !result.jobId) throw new Error(result.message || 'Could not create page count job.');
 
         const jobId = result.jobId;
@@ -261,119 +322,212 @@ export function OrderForm({ initialPrinters, currentStep, setStep }: OrderFormPr
     }
   };
 
-  const uploadFileAndGetPageCount = useCallback(async (fileDetail: FileDetails) => {
-    const { id, originalFile, isWordFile, isImageFile } = fileDetail;
+  const uploadFileAndGetPageCount = useCallback(async (file: File, isWordFile: boolean, fileId: string, groupId?: string, subFileId?: string) => {
     
-    updateFileDetails(id, { status: 'uploading', message: 'Requesting upload URL...' });
+    const updateTarget = (details: Partial<SubFileDetails> | Partial<FileDetails>) => {
+        if (groupId && subFileId) {
+            updateSubFileDetails(groupId, subFileId, details);
+        } else {
+            updateFileDetails(fileId, details);
+        }
+    };
+    
+    updateTarget({ status: 'uploading', progress: 5, message: 'Preparing file...' });
 
     try {
-        const getUrlResult = await getGoogleDriveUploadUrl(originalFile.name, originalFile.type, window.location.origin);
-        if (!getUrlResult.success || !getUrlResult.uniqueFileName || !getUrlResult.uploadUrl) {
-            throw new Error(getUrlResult.message || 'Could not get upload URL.');
+        updateTarget({ progress: 25, message: 'Getting upload URL...' });
+        
+        const urlResult = await getTelegramUploadUrl(file.name);
+        if (!urlResult.success || !urlResult.uploadUrl || !urlResult.boundary) {
+             throw new Error(urlResult.message || 'Could not get upload URL.');
         }
 
-        const uniqueFileName = getUrlResult.uniqueFileName;
-        updateFileDetails(id, { uniqueFileName: uniqueFileName });
-
-        const xhr = new XMLHttpRequest();
-        xhr.open('PUT', getUrlResult.uploadUrl);
-        xhr.setRequestHeader('Content-Type', originalFile.type);
-
-        xhr.upload.onprogress = (event) => {
-            if (event.lengthComputable) {
-                const progress = Math.round((event.loaded / event.total) * 100);
-                updateFileDetails(id, { progress, message: 'Uploading...' });
-            }
-        };
+        const { uploadUrl, boundary } = urlResult;
         
-        xhr.onload = async () => {
-            if (xhr.status >= 200 && xhr.status < 300) {
-                 updateFileDetails(id, { progress: 100, status: 'getting_id', message: 'Verifying upload...' });
-                
-                 await new Promise(resolve => setTimeout(resolve, 2000));
+        const bodyParts = [
+          `--${boundary}\r\n`,
+          `Content-Disposition: form-data; name="document"; filename="${file.name}"\r\n`,
+          `Content-Type: ${file.type}\r\n\r\n`,
+          file, // The File object itself
+          `\r\n--${boundary}--\r\n`
+        ];
+        
+        const blob = new Blob(bodyParts, { type: `multipart/form-data; boundary=${boundary}` });
 
-                 const idResult = await getDriveFileIdByName(uniqueFileName);
-                 if (!idResult.success || !idResult.fileId) {
-                     throw new Error(`File '${uniqueFileName}' not found in Drive after upload.`);
-                 }
-                 const googleDriveFileId = idResult.fileId;
-                 updateFileDetails(id, { googleDriveFileId });
+        updateTarget({ progress: 50, message: 'Uploading to secure storage...' });
 
-                if (isWordFile) {
-                    await handleWordPageCount(id, googleDriveFileId, uniqueFileName);
-                } else {
-                    updateFileDetails(id, { status: 'ready_for_config', message: 'Ready to configure.' });
+        const response = await fetch(uploadUrl, {
+            method: 'POST',
+            body: blob,
+            headers: {
+                'Content-Type': `multipart/form-data; boundary=${boundary}`,
+            },
+        });
+
+        if (!response.ok) {
+            let errorText = await response.text();
+            try {
+                const errorJson = JSON.parse(errorText);
+                errorText = errorJson.description || errorText;
+            } catch(e) {}
+            throw new Error(`Telegram upload failed: ${errorText}`);
+        }
+        
+        const data = await response.json();
+        
+        if (!data.ok || !data.result.document) {
+            throw new Error('Telegram did not return a valid file ID.');
+        }
+
+        const telegramFileId = data.result.document.file_id;
+        
+        updateTarget({ googleDriveFileId: telegramFileId, progress: 100, status: 'complete', message: 'Upload complete.' });
+
+        if (isWordFile && !groupId) { // Only do this for single doc files
+            await handleWordPageCount(fileId, telegramFileId, file.name);
+        } else if (!groupId) { // Single non-word file
+             updateFileDetails(fileId, { status: 'ready_for_config', message: 'Ready to configure.' });
+        } else {
+            setFiles(currentFiles => {
+                const group = currentFiles.find(f => f.id === groupId);
+                if (group && group.isGroup && group.imageFiles.every(sf => sf.status === 'complete')) {
+                    return currentFiles.map(f => f.id === groupId ? { ...f, status: 'ready_for_config', message: 'Ready to configure.' } : f);
                 }
-            } else {
-                updateFileDetails(id, { status: 'error', message: `Upload failed: ${xhr.statusText}` });
-            }
-        };
-
-        xhr.onerror = () => {
-             updateFileDetails(id, { status: 'error', message: 'Upload failed due to network error.' });
-        };
-        xhr.send(originalFile);
+                return currentFiles;
+            });
+        }
     } catch (error: any) {
         console.error("Error in uploadFileAndGetPageCount:", error);
-        updateFileDetails(id, { status: 'error', message: error.message || 'Could not prepare upload.' });
+        updateTarget({ status: 'error', message: error.message || 'Could not prepare upload.' });
     }
   }, []);
 
-  const handleFileChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
-    const selectedFiles = e.target.files;
-    if (!selectedFiles) return;
 
+  const processNewFiles = useCallback((newFiles: File[]) => {
     setSubmissionError(null);
     if(lastSuccessfulJobs) setLastSuccessfulJobs(null);
 
-    const newFileDetails: FileDetails[] = Array.from(selectedFiles).map(file => {
-      const isImage = file.type.startsWith('image/');
-      const isWord = file.type.includes('wordprocessingml');
+    const newFileDetails: FileDetails[] = newFiles.map(file => {
+      const isImage = file.type.startsWith('image/') || /\.(heic|heif|heics|heifs|avif|webp|png|jpe?g|gif|bmp|tiff?)$/i.test(file.name);
+      const isWord = file.type.includes('wordprocessingml') || /\.docx?$/i.test(file.name);
       
-      return {
-        id: uuidv4(), originalFile: file, pageCount: null, isWordFile: isWord, isImageFile: isImage,
-        uniqueFileName: null, googleDriveFileId: null, printType: isImage ? 'color' : 'bw', copies: 1, pageRange: '',
-        duplex: 'one-sided', 
-        paperSize: 'A4', orientation: 'portrait',
-        imageLayout: { type: 'full-page', photosPerPage: 1, fit: 'contain' },
-        cost: 0, progress: 0, status: 'pending'
+      const fileId = uuidv4();
+      const subFile: SubFileDetails = {
+          id: uuidv4(), originalFile: file, previewUrl: '',
+          googleDriveFileId: null,
+          status: 'pending', progress: 0
       };
-    });
 
-    setFiles(current => [...current, ...newFileDetails]);
+      const reader = new FileReader();
+      reader.onload = async (event) => {
+          const result = event.target?.result as string;
+           if (isImage) {
+                setFiles(current => current.map(f => {
+                    if (f.id === fileId) {
+                        const newImageFiles = f.imageFiles.map(sf => sf.id === subFile.id ? { ...sf, previewUrl: result } : sf);
+                        return { ...f, imageFiles: newImageFiles };
+                    }
+                    return f;
+                }));
+           }
+          
+           uploadFileAndGetPageCount(file, isWord, fileId, isImage ? fileId : undefined, isImage ? subFile.id : undefined);
 
-    newFileDetails.forEach(fileDetail => {
-        const reader = new FileReader();
-        reader.onload = async (event) => {
-            const result = event.target?.result as string;
-            updateFileDetails(fileDetail.id, { previewUrl: result });
-
-            if (fileDetail.originalFile.type === 'application/pdf') {
+           if (!isImage && file.type === 'application/pdf') {
                 try {
                     const pdfjsLib = await import('pdfjs-dist');
                     pdfjsLib.GlobalWorkerOptions.workerSrc = `//cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.mjs`;
-                    const arrayBuffer = await fileDetail.originalFile.arrayBuffer();
+                    const arrayBuffer = await file.arrayBuffer();
                     const pdf = await pdfjsLib.getDocument(arrayBuffer).promise;
-                    updateFileDetails(fileDetail.id, { pageCount: pdf.numPages });
+                    updateFileDetails(fileId, { pageCount: pdf.numPages, status: 'ready_for_config', message: 'Ready to configure.' });
                 } catch (pdfError) {
                     console.error("Error reading PDF:", pdfError);
-                    updateFileDetails(fileDetail.id, { status: 'error', message: 'Could not read PDF page count.' });
+                    updateFileDetails(fileId, { status: 'error', message: 'Could not read PDF page count.' });
                 }
-            } else if (fileDetail.isImageFile) {
-                updateFileDetails(fileDetail.id, { pageCount: 1 });
             }
-            
-            uploadFileAndGetPageCount(fileDetail);
-        };
-        reader.onerror = () => {
-            updateFileDetails(fileDetail.id, { status: 'error', message: 'Could not read file for preview.' });
-        };
-        reader.readAsDataURL(fileDetail.originalFile);
+      };
+      reader.onerror = () => {
+          updateFileDetails(fileId, { status: 'error', message: 'Could not read file for preview.' });
+      };
+      reader.readAsDataURL(file);
+
+      // Always treat images as groups, even if it's a single image.
+      // This ensures they go through the collage layout logic.
+      if (isImage) {
+          return {
+              id: fileId, isGroup: true, imageFiles: [subFile],
+              pageCount: 1, // A single image is one page/item
+              isWordFile: false, isImageFile: true,
+              printType: 'color', copies: 1, pageRange: 'all', duplex: 'one-sided',
+              paperSize: 'A4', orientation: 'auto',
+              imageLayout: { type: 'full-page', photosPerPage: 1, fit: 'contain' },
+              cost: 0, progress: 0, status: 'pending', message: 'Processing images...',
+              googleDriveFileId: null
+          };
+      } else {
+          return {
+              id: fileId, isGroup: false, originalFile: file, imageFiles: [],
+              pageCount: null, isWordFile: isWord, isImageFile: false,
+              googleDriveFileId: null, printType: 'bw', copies: 1, pageRange: '',
+              duplex: 'one-sided', paperSize: 'A4', orientation: 'portrait',
+              imageLayout: { type: 'full-page', photosPerPage: 1, fit: 'contain' },
+              cost: 0, progress: 0, status: 'pending',
+          };
+      }
     });
-}, [uploadFileAndGetPageCount, lastSuccessfulJobs]);
+
+    setFiles(current => [...current, ...newFileDetails]);
+  }, [lastSuccessfulJobs, uploadFileAndGetPageCount]);
+  
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const selectedFiles = e.target.files;
+    if (!selectedFiles) return;
+    processNewFiles(Array.from(selectedFiles));
+    if (fileInputRef.current) fileInputRef.current.value = ''; // Reset file input
+  };
   
   const removeFile = (id: string) => {
     setFiles(files => files.filter(f => f.id !== id));
+  };
+
+  const removeSubFile = (groupId: string, subFileId: string) => {
+    setFiles(currentFiles => currentFiles.map(group => {
+        if (group.id === groupId && group.isGroup) {
+            const newImageFiles = group.imageFiles.filter(sf => sf.id !== subFileId);
+            return { ...group, imageFiles: newImageFiles };
+        }
+        return group;
+    }).filter(g => !g.isGroup || g.imageFiles.length > 0)); // Remove empty groups
+  };
+  
+  const handleAddPhotos = (groupId: string) => {
+      const input = document.createElement('input');
+      input.type = 'file';
+      input.accept = 'image/*';
+      input.multiple = true;
+      input.onchange = (e) => {
+          const target = e.target as HTMLInputElement;
+          const newPhotos = Array.from(target.files || []);
+          if (newPhotos.length > 0) {
+              const newSubFiles: SubFileDetails[] = newPhotos.map(p => ({
+                  id: uuidv4(), originalFile: p, previewUrl: '',
+                  googleDriveFileId: null,
+                  status: 'pending', progress: 0
+              }));
+
+              setFiles(current => current.map(f => f.id === groupId ? { ...f, imageFiles: [...f.imageFiles, ...newSubFiles] } : f));
+              
+              newSubFiles.forEach(subFile => {
+                  const reader = new FileReader();
+                  reader.onload = (event) => {
+                      updateSubFileDetails(groupId, subFile.id, { previewUrl: event.target?.result as string });
+                      uploadFileAndGetPageCount(subFile.originalFile, false, groupId, groupId, subFile.id);
+                  };
+                  reader.readAsDataURL(subFile.originalFile);
+              });
+          }
+      };
+      input.click();
   };
   
   const handleSubmit = async (event: React.FormEvent) => {
@@ -405,85 +559,156 @@ export function OrderForm({ initialPrinters, currentStep, setStep }: OrderFormPr
     let jobsToCreate: Omit<PrintJob, 'id' | 'createdAt'>[] = [];
     const filesToBindIndices = binding === 'none' ? [] : parsePageRanges(bindingFileNumbers, filesToSubmit.length).map(i => i + 1); // 1-indexed
 
-    // Separate bound files from unbound files
-    const boundFileDetails: FileDetails[] = [];
-    const unboundFileDetails: FileDetails[] = [];
-
-    filesToSubmit.forEach((file, index) => {
-        const fileNumber = index + 1;
-        if (filesToBindIndices.includes(fileNumber)) {
-            boundFileDetails.push(file);
-        } else {
-            unboundFileDetails.push(file);
-        }
-    });
-
     const fileDetailsToJobs = (details: FileDetails[]): FileInJob[] => {
-      return details.map(f => ({
-        fileName: f.uniqueFileName!, originalFileName: f.originalFile.name, googleDriveFileId: f.googleDriveFileId!,
-        isWordFile: f.isWordFile, isImageFile: f.isImageFile, pageCount: f.pageCount!, pageRange: f.isImageFile ? 'all' : (f.pageRange.trim() || 'all'),
-        copies: f.copies, printType: f.printType, paperSize: f.paperSize, imageLayout: f.isImageFile ? f.imageLayout : undefined,
-        orientation: f.orientation, duplex: f.duplex,
-      }));
+      return details.map(f => {
+          if (f.isGroup) {
+              const imageFiles: ImageFile[] = f.imageFiles.map(sf => ({
+                  originalFileName: sf.originalFile.name,
+                  googleDriveFileId: sf.googleDriveFileId!,
+                  uniqueFileName: sf.originalFile.name,
+              }));
+              return {
+                  isGroup: true,
+                  imageFiles: imageFiles,
+                  originalFileName: f.imageFiles.length > 1 ? "Image Collage" : f.imageFiles[0].originalFile.name,
+                  fileName: `collage-${f.id}`,
+                  googleDriveFileId: 'group', // Placeholder
+                  isWordFile: false, isImageFile: true, pageCount: f.imageFiles.length, pageRange: 'all',
+                  copies: f.copies, printType: f.printType, paperSize: f.paperSize, imageLayout: f.imageLayout,
+                  orientation: f.orientation, duplex: 'one-sided', // Duplex doesn't apply to photo sheets
+              };
+          } else {
+              return {
+                  isGroup: false,
+                  fileName: f.originalFile!.name, originalFileName: f.originalFile!.name, googleDriveFileId: f.googleDriveFileId!,
+                  isWordFile: f.isWordFile, isImageFile: f.isImageFile, pageCount: f.pageCount!, pageRange: f.pageRange.trim() || 'all',
+                  copies: f.copies, printType: f.printType, paperSize: f.paperSize,
+                  orientation: f.orientation, duplex: f.duplex,
+              };
+          }
+      });
     };
 
-    // Create a single job for all bound files
-    if (boundFileDetails.length > 0) {
-        const boundFilesForJob = fileDetailsToJobs(boundFileDetails);
-        const cost = boundFileDetails.reduce((acc, f) => acc + (f.cost || 0), 0);
-        
-        const compatiblePrinters = onlinePrinters.filter(p => boundFilesForJob.every(f => {
-            const caps = p.capabilities || [];
-            return caps.includes(f.printType) && caps.includes(f.paperSize) && (f.duplex === 'one-sided' || (caps.includes('duplex') || caps.includes('single-sided')));
-        })).sort((a,b) => (a.queueLength || 0) - (b.queueLength || 0));
+    const isPrinterCompatible = (printer: Printer, file: FileDetails) => {
+        const caps = printer.capabilities || [];
+        const duplexCompatible = file.duplex === 'one-sided' || caps.includes('duplex');
+        return caps.includes(file.printType) && caps.includes(file.paperSize) && duplexCompatible;
+    };
 
-        if(compatiblePrinters.length === 0) {
-            setSubmissionError('No single printer is compatible with all files selected for binding.');
-            setIsSubmitting(false);
-            return;
-        }
-        const assignedPrinter = compatiblePrinters[0];
+    // --- NEW ASSIGNMENT LOGIC ---
+    // 1. Try to find a single printer for the whole order.
+    const allCompatiblePrinters = onlinePrinters.filter(p => 
+        filesToSubmit.every(f => isPrinterCompatible(p, f))
+    );
 
-        jobsToCreate.push({
-            orderType: 'print', status: 'pending-payment', printerId: assignedPrinter.id, name: assignedPrinter.name, cost,
-            username: "Customer", orderId: overallOrderId, binding: binding, files: boundFilesForJob, phoneNumber,
-        });
+    let strategy: 'user-based' | 'job-based' = 'job-based';
+    let assignedUserPrinter: Printer | null = null;
+
+    if (allCompatiblePrinters.length > 0) {
+        strategy = 'user-based';
+        const printerIndex = userOrderCounter % allCompatiblePrinters.length;
+        assignedUserPrinter = allCompatiblePrinters[printerIndex];
+        userOrderCounter++; // Increment for the next user.
     }
 
-    // Group unbound files by their capability requirements
-    const jobsByCategory = new Map<string, FileDetails[]>();
-    unboundFileDetails.forEach(f => {
-        const category = getFileCategory(f);
-        const categoryFiles = jobsByCategory.get(category) || [];
-        categoryFiles.push(f);
-        jobsByCategory.set(category, categoryFiles);
-    });
+    if (strategy === 'user-based' && assignedUserPrinter) {
+        // --- User-Based Assignment ---
+        console.log(`Assigning all jobs for order ${overallOrderId} to printer: ${assignedUserPrinter.name}`);
+        const boundFileDetails: FileDetails[] = [];
+        const unboundFileDetails: FileDetails[] = [];
 
-    const categoriesToAdvance = new Set<string>();
-
-    for (const [category, filesForCategory] of jobsByCategory.entries()) {
-        const filesForThisJob = fileDetailsToJobs(filesForCategory);
-        
-        const compatiblePrinters = onlinePrinters.filter(p => {
-            const file = filesForCategory[0]; // All files in category have same requirements
-            const caps = p.capabilities || [];
-            const duplexCompatible = file.duplex === 'one-sided' || (caps.includes('duplex') || caps.includes('single-sided'));
-            return caps.includes(file.printType) && caps.includes(file.paperSize) && duplexCompatible;
+        filesToSubmit.forEach((file, index) => {
+            const fileNumber = index + 1;
+            if (filesToBindIndices.includes(fileNumber)) {
+                boundFileDetails.push(file);
+            } else {
+                unboundFileDetails.push(file);
+            }
         });
 
-        if (compatiblePrinters.length === 0) {
-            filesForCategory.forEach(f => updateFileDetails(f.id, { status: 'error', message: `No compatible printer for ${f.originalFile.name}.` }));
-            continue;
+        // Create a single job for all bound files
+        if (boundFileDetails.length > 0) {
+            const boundFilesForJob = fileDetailsToJobs(boundFileDetails);
+            const cost = boundFileDetails.reduce((acc, f) => acc + (f.cost || 0), 0);
+            jobsToCreate.push({
+                orderType: 'print', status: 'pending-payment', printerId: assignedUserPrinter.id, name: assignedUserPrinter.name, cost,
+                username: "Customer", orderId: overallOrderId, binding: binding, files: boundFilesForJob, phoneNumber,
+            });
         }
+        
+        // Create one job for all unbound files
+        if (unboundFileDetails.length > 0) {
+            const unboundFilesForJob = fileDetailsToJobs(unboundFileDetails);
+            const cost = unboundFileDetails.reduce((acc, f) => acc + (f.cost || 0), 0);
+            jobsToCreate.push({
+                orderType: 'print', status: 'pending-payment', printerId: assignedUserPrinter.id, name: assignedUserPrinter.name, cost,
+                username: "Customer", orderId: overallOrderId, binding: undefined, files: unboundFilesForJob, phoneNumber,
+            });
+        }
+    } else {
+        // --- Fallback to Job-Based Assignment ---
+        console.log(`No single printer compatible for all jobs. Falling back to job-based assignment for order ${overallOrderId}.`);
+        const boundFileDetails: FileDetails[] = [];
+        const unboundFileDetails: FileDetails[] = [];
 
-        const printerIndex = getNextIndex(category, compatiblePrinters.length);
-        const assignedPrinter = compatiblePrinters[printerIndex];
-        categoriesToAdvance.add(category);
+        filesToSubmit.forEach((file, index) => {
+            const fileNumber = index + 1;
+            if (filesToBindIndices.includes(fileNumber)) {
+                boundFileDetails.push(file);
+            } else {
+                unboundFileDetails.push(file);
+            }
+        });
 
-        const jobCost = filesForCategory.reduce((acc, f) => acc + (f.cost || 0), 0);
-        jobsToCreate.push({
-            orderType: 'print', status: 'pending-payment', printerId: assignedPrinter.id, name: assignedPrinter.name, cost: jobCost,
-            username: "Customer", orderId: overallOrderId, binding: undefined, files: filesForThisJob, phoneNumber,
+        if (boundFileDetails.length > 0) {
+            const boundFilesForJob = fileDetailsToJobs(boundFileDetails);
+            const cost = boundFileDetails.reduce((acc, f) => acc + (f.cost || 0), 0);
+            
+            const compatiblePrinters = onlinePrinters.filter(p => boundFileDetails.every(f => isPrinterCompatible(p, f))).sort((a,b) => (a.queueLength || 0) - (b.queueLength || 0));
+
+            if(compatiblePrinters.length === 0) {
+                setSubmissionError('No single printer is compatible with all files selected for binding.');
+                setIsSubmitting(false);
+                return;
+            }
+            const assignedPrinter = compatiblePrinters[0];
+
+            jobsToCreate.push({
+                orderType: 'print', status: 'pending-payment', printerId: assignedPrinter.id, name: assignedPrinter.name, cost,
+                username: "Customer", orderId: overallOrderId, binding: binding, files: boundFilesForJob, phoneNumber,
+            });
+        }
+        
+        const jobsByCategory = new Map<string, FileDetails[]>();
+        unboundFileDetails.forEach(f => {
+            const category = getFileCategory(f);
+            const categoryFiles = jobsByCategory.get(category) || [];
+            categoryFiles.push(f);
+            jobsByCategory.set(category, categoryFiles);
+        });
+
+        const categoriesToAdvance = new Set<string>();
+
+        for (const [category, filesForCategory] of jobsByCategory.entries()) {
+            const filesForThisJob = fileDetailsToJobs(filesForCategory);
+            const compatiblePrinters = onlinePrinters.filter(p => isPrinterCompatible(p, filesForCategory[0]));
+
+            if (compatiblePrinters.length === 0) {
+                filesForCategory.forEach(f => updateFileDetails(f.id, { status: 'error', message: `No compatible printer for this file type.` }));
+                continue;
+            }
+            const printerIndex = getNextIndex(category, compatiblePrinters.length);
+            const assignedPrinter = compatiblePrinters[printerIndex];
+            categoriesToAdvance.add(category);
+            const jobCost = filesForCategory.reduce((acc, f) => acc + (f.cost || 0), 0);
+            jobsToCreate.push({
+                orderType: 'print', status: 'pending-payment', printerId: assignedPrinter.id, name: assignedPrinter.name, cost: jobCost,
+                username: "Customer", orderId: overallOrderId, binding: undefined, files: filesForThisJob, phoneNumber,
+            });
+        }
+        categoriesToAdvance.forEach(category => {
+            const compatiblePrinters = onlinePrinters.filter(p => isPrinterCompatible(p, jobsByCategory.get(category)![0]));
+            advanceIndex(category, compatiblePrinters.length);
         });
     }
 
@@ -494,23 +719,29 @@ export function OrderForm({ initialPrinters, currentStep, setStep }: OrderFormPr
         return;
     }
     
-    // Advance rotation indices only after a successful job creation attempt.
-    categoriesToAdvance.forEach(category => {
-      const compatiblePrinters = onlinePrinters.filter(p => {
-            const file = jobsByCategory.get(category)?.[0];
-            if (!file) return false;
-            const caps = p.capabilities || [];
-            const duplexCompatible = file.duplex === 'one-sided' || (caps.includes('duplex') || caps.includes('single-sided'));
-            return caps.includes(file.printType) && caps.includes(file.paperSize) && duplexCompatible;
-      });
-      advanceIndex(category, compatiblePrinters.length);
-    });
-
-
-    const finalTotalCost = jobsToCreate.reduce((acc, job) => acc + job.cost, 0);
-
-    // --- Razorpay Order Creation ---
     try {
+        setSubmissionError('Creating jobs...');
+        const createdJobs: PrintJob[] = [];
+        const createdJobIds: string[] = [];
+
+        for(const jobData of jobsToCreate) {
+            const creationResult = await createPrintJob(jobData);
+            if (!creationResult.success || !creationResult.id) {
+                // Attempt to clean up already created jobs if one fails
+                if (createdJobIds.length > 0) {
+                    console.warn("Rolling back pending-payment jobs due to creation failure.");
+                    // This is a soft delete, a proper rollback would be more complex
+                    await updatePrintJobsWithPayment(createdJobIds, "FAILED", "FAILED");
+                }
+                throw new Error(creationResult.message || `Failed to create job.`);
+            }
+            createdJobs.push({ ...jobData, id: creationResult.id, createdAt: new Date().toISOString() });
+            createdJobIds.push(creationResult.id);
+        }
+
+        const finalTotalCost = jobsToCreate.reduce((acc, job) => acc + job.cost, 0);
+        setSubmissionError('Redirecting to payment...');
+
         const razorpayOrderResult = await createRazorpayOrder(finalTotalCost, 'INR', overallOrderId);
         if (!razorpayOrderResult.success || !razorpayOrderResult.order) {
             throw new Error(razorpayOrderResult.message || 'Could not create Razorpay order.');
@@ -522,7 +753,7 @@ export function OrderForm({ initialPrinters, currentStep, setStep }: OrderFormPr
             key: process.env.NEXT_PUBLIC_RAZORPAY_KEY_ID,
             amount: razorpayOrder.amount,
             currency: razorpayOrder.currency,
-            name: "PrintEase",
+            name: "PrintEx",
             description: `Print Order #${overallOrderId}`,
             order_id: razorpayOrder.id,
             handler: async (response: any) => {
@@ -532,19 +763,8 @@ export function OrderForm({ initialPrinters, currentStep, setStep }: OrderFormPr
                 const verificationResult = await verifyRazorpayPayment(response.razorpay_order_id, response.razorpay_payment_id, response.razorpay_signature);
 
                 if (verificationResult.success) {
-                    setSubmissionError('Payment successful! Creating print jobs...');
-                    
-                    const createdJobs: PrintJob[] = [];
-                    const createdJobIds: string[] = [];
-                    for(const jobData of jobsToCreate) {
-                        const creationResult = await createPrintJob(jobData);
-                        if (!creationResult.success || !creationResult.id) throw new Error(creationResult.message || `Failed to create job.`);
-                        createdJobs.push({ ...jobData, id: creationResult.id, createdAt: new Date().toISOString() });
-                        createdJobIds.push(creationResult.id);
-                    }
-                    
+                    setSubmissionError('Payment successful! Finalizing print jobs...');
                     await updatePrintJobsWithPayment(createdJobIds, response.razorpay_payment_id, response.razorpay_order_id);
-
                     setLastSuccessfulJobs(createdJobs);
                     setFiles([]);
                     setBinding('none');
@@ -564,31 +784,42 @@ export function OrderForm({ initialPrinters, currentStep, setStep }: OrderFormPr
             theme: {
                 color: "#3F51B5"
             },
-            config: {
-                display: {
-                    blocks: {
-                        banks: {
-                            name: 'Pay using UPI',
-                            instruments: [
-                                { method: 'upi' }
-                            ]
-                        }
-                    },
-                    sequence: ['block.banks'],
-                    preferences: {
-                        show_default_blocks: false
-                    }
+            modal: {
+                ondismiss: async () => {
+                    // This is important. If user closes the modal, we don't want to leave them in a submitting state.
+                    setIsSubmitting(false);
+                    setSubmissionError('Payment was not completed.');
+                    
+                    // Update job status to cancelled
+                    await updatePrintJobsWithPayment(createdJobIds, "CANCELLED", razorpayOrder.id, 'cancelled');
+
+                    toast({
+                        title: "Payment Cancelled",
+                        description: "Your order was not completed. Please try again.",
+                        variant: "destructive"
+                    });
                 }
-            }
+            },
+            method: {
+                upi: true,
+                card: false,
+                netbanking: false,
+                wallet: false,
+            },
+            upi: {
+                flow: "intent"
+            },
         };
 
         const rzp = new (window as any).Razorpay(options);
-        rzp.on('payment.failed', (response: any) => {
+        rzp.on('payment.failed', async (response: any) => {
             setSubmissionError(`Payment failed. Error: ${response.error.description}`);
             setIsSubmitting(false);
+            await updatePrintJobsWithPayment(createdJobIds, response.error.metadata.payment_id, response.error.metadata.order_id, 'error');
         });
         rzp.open();
-        setIsSubmitting(false);
+        // Don't set submitting to false here, because the Razorpay modal is now controlling the flow.
+        // It will be set to false in the handler or on dismiss.
 
     } catch (error: any) {
         setSubmissionError(error.message || 'An unknown error occurred during payment initiation.');
@@ -687,30 +918,32 @@ export function OrderForm({ initialPrinters, currentStep, setStep }: OrderFormPr
     <Card>
       <CardHeader>
         <CardTitle>Step 1: Upload Your Files</CardTitle>
-        <CardDescription>Upload PDF, Word, or image files. The process will start automatically.</CardDescription>
+        <CardDescription>Upload PDF, Word, or image files. Photos will be grouped for collages.</CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
         {files.map((file, index) => (
           <Card key={file.id} className={cn("p-4 relative", index % 2 === 0 ? "bg-blue-50" : "bg-yellow-50")}>
              <div className="absolute top-2 left-2 bg-primary text-primary-foreground h-6 w-6 flex items-center justify-center rounded-full text-sm font-bold">{index + 1}</div>
             <div className="flex items-start gap-4 pl-8">
-               {file.previewUrl && file.isImageFile ? (
-                <Image src={file.previewUrl} alt="preview" width={48} height={48} className="rounded-md object-cover h-12 w-12" />
-              ) : (
+               {file.isGroup ? (
+                 <div className="h-12 w-12 flex items-center justify-center bg-purple-100 rounded-md">
+                   <ImageIcon className="w-6 h-6 text-purple-600" />
+                </div>
+               ) : (
                 <div className="h-12 w-12 flex items-center justify-center bg-blue-100 rounded-md">
                    <FileUp className="w-6 h-6 text-blue-600" />
                 </div>
               )}
               <div className="flex-1">
-                <p className="font-semibold">{file.originalFile.name}</p>
+                <p className="font-semibold">{file.isGroup ? (file.imageFiles.length > 1 ? `Image Collage (${file.imageFiles.length} photos)` : file.imageFiles[0]?.originalFile.name || 'Image') : file.originalFile?.name}</p>
                  <p className="text-sm text-muted-foreground">
                     {file.status === 'pending' && 'Waiting to start...'}
-                    {(file.status === 'uploading' || file.status === 'getting_id') && file.message}
+                    {(file.status === 'uploading') && file.message}
                     {file.status === 'counting_pages' && file.message}
-                    {file.pageCount !== null && `Total of ${file.pageCount} pages.`}
+                    {!file.isGroup && file.pageCount !== null && `Total of ${file.pageCount} pages.`}
                  </p>
                 <div className="mt-2">
-                    {(file.status === 'uploading' || file.status === 'getting_id' || file.status === 'counting_pages') && <Progress value={file.progress} className="h-1" />}
+                    {(file.status === 'uploading' || file.status === 'counting_pages') && <Progress value={file.progress} className="h-1" />}
                     {file.status === 'error' && (
                          <div className="flex items-center gap-2 text-sm text-red-600 font-medium">
                             <XCircle className="w-4 h-4" />
@@ -730,14 +963,42 @@ export function OrderForm({ initialPrinters, currentStep, setStep }: OrderFormPr
                     <Trash2 className="w-4 h-4 text-muted-foreground" />
                 </Button>
                 {file.status === 'error' && (
-                    <Button variant="outline" size="sm" onClick={() => uploadFileAndGetPageCount(file)}>
+                    <Button variant="outline" size="sm" onClick={() => file.isGroup ? file.imageFiles.forEach(sf => { if(sf.status === 'error') uploadFileAndGetPageCount(sf.originalFile, false, file.id, file.id, sf.id) }) : uploadFileAndGetPageCount(file.originalFile!, file.isWordFile, file.id)}>
                         <RefreshCw className="w-3 h-3 mr-1.5" />
                         Retry
                     </Button>
                 )}
               </div>
             </div>
-             {!file.isImageFile && file.status === 'ready_for_config' && (
+
+            {file.isGroup && (
+                <div className="mt-4 pl-8 md:pl-16 space-y-3">
+                    <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3">
+                        {file.imageFiles.map(sf => (
+                             <div key={sf.id} className="relative aspect-square group">
+                                {sf.previewUrl ? (
+                                    <Image src={sf.previewUrl} alt="preview" fill className="rounded-md object-cover" />
+                                ) : (
+                                    <div className="w-full h-full bg-gray-200 rounded-md flex items-center justify-center">
+                                        <Loader2 className="w-5 h-5 animate-spin text-gray-500"/>
+                                    </div>
+                                )}
+                                <div className="absolute inset-0 bg-black/50 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
+                                    <Button variant="destructive" size="icon" className="h-7 w-7" onClick={() => removeSubFile(file.id, sf.id)}>
+                                        <Trash2 className="w-4 h-4" />
+                                    </Button>
+                                </div>
+                                {sf.status === 'error' && <div className="absolute bottom-1 right-1 bg-red-500 text-white rounded-full p-0.5"><XCircle className="w-3 h-3"/></div>}
+                             </div>
+                        ))}
+                         <button onClick={() => handleAddPhotos(file.id)} className="aspect-square border-2 border-dashed rounded-md flex flex-col items-center justify-center text-muted-foreground hover:bg-gray-100 hover:border-primary hover:text-primary transition-colors">
+                            <PlusCircle className="w-6 h-6" />
+                            <span className="text-xs mt-1">Add Photos</span>
+                        </button>
+                    </div>
+                </div>
+            )}
+             {!file.isGroup && !file.isImageFile && file.status === 'ready_for_config' && (
                 <div className="mt-4 pl-8 md:pl-16">
                     <Label htmlFor={`page-range-${file.id}`} className="font-medium">Page Range (optional)</Label>
                     <Input id={`page-range-${file.id}`} className="mt-1 bg-white" placeholder="e.g., 1-5, 8, 11-13. Leave blank for all." value={file.pageRange} onChange={(e) => updateFileDetails(file.id, { pageRange: e.target.value })}/>
@@ -748,7 +1009,7 @@ export function OrderForm({ initialPrinters, currentStep, setStep }: OrderFormPr
          <div className="space-y-2 pt-4">
             <Label htmlFor="file-upload" className="font-semibold">Upload More Files</Label>
             <div className="relative">
-                <Input id="file-upload" type="file" accept=".pdf,.doc,.docx,.jpg,.jpeg,.png,image/*" onChange={handleFileChange} className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" multiple />
+                <Input id="file-upload" type="file" ref={fileInputRef} accept=".pdf,.doc,.docx,.jpg,.jpeg,.png,.webp,.heic,.heif,.avif,.gif,.bmp,.tiff,.tif,image/*" onChange={handleFileChange} className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" multiple />
                 <div className="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center bg-white hover:bg-gray-50 cursor-pointer">
                     <FileUp className="mx-auto h-12 w-12 text-gray-400" />
                     <p className="mt-2 text-sm text-muted-foreground">Click or drag to upload</p>
@@ -773,7 +1034,7 @@ export function OrderForm({ initialPrinters, currentStep, setStep }: OrderFormPr
         {filesReadyForConfig.map((file, index) => (
             <Card key={file.id} className={cn("p-4 relative", index % 2 === 0 ? "bg-blue-50" : "bg-yellow-50")}>
                  <div className="absolute top-2 left-2 bg-primary text-primary-foreground h-6 w-6 flex items-center justify-center rounded-full text-sm font-bold">{index + 1}</div>
-                 <p className="font-semibold text-center mb-4 pt-1">{file.originalFile.name}</p>
+                 <p className="font-semibold text-center mb-4 pt-1">{file.isGroup ? `Image Collage (${file.imageFiles.length} photos)` : file.originalFile?.name}</p>
                 <div className={cn("grid grid-cols-1 pt-4 gap-x-6 gap-y-6 md:grid-cols-3")}>
                     <div>
                         <Label className="font-medium text-sm">Print Quality</Label>
@@ -799,7 +1060,7 @@ export function OrderForm({ initialPrinters, currentStep, setStep }: OrderFormPr
                             </SelectContent>
                         </Select>
                     </div>
-                    {!file.isImageFile && (
+                    
                       <div className="space-y-2">
                           <Label className="font-medium text-sm">Copies</Label>
                           <div className="flex items-center gap-1">
@@ -808,7 +1069,7 @@ export function OrderForm({ initialPrinters, currentStep, setStep }: OrderFormPr
                               <Button variant="outline" size="icon" className="h-10 w-10 bg-white" onClick={() => updateFileDetails(file.id, { copies: file.copies + 1 })}><Plus className="w-4 h-4" /></Button>
                           </div>
                       </div>
-                    )}
+                    
                 </div>
             </Card>
         ))}
@@ -832,77 +1093,195 @@ export function OrderForm({ initialPrinters, currentStep, setStep }: OrderFormPr
         {filesReadyForConfig.map((file, index) => (
           <Card key={file.id} className={cn("p-4 relative overflow-hidden", index % 2 === 0 ? "bg-blue-50" : "bg-yellow-50")}>
             <div className="absolute top-2 left-2 bg-primary text-primary-foreground h-6 w-6 flex items-center justify-center rounded-full text-sm font-bold">{index + 1}</div>
-            <p className="font-semibold text-center mb-4 pt-1">{file.originalFile.name}</p>
+            <p className="font-semibold text-center mb-4 pt-1">{file.isGroup ? (file.imageFiles.length > 1 ? `Image Collage (${file.imageFiles.length} photos)` : file.imageFiles[0]?.originalFile.name || 'Image') : file.originalFile?.name}</p>
 
             {file.isImageFile ? (
-              // IMAGE LAYOUT
-              <div className="grid md:grid-cols-2 gap-8">
+              // IMPROVED IMAGE LAYOUT
+              <div className="space-y-6">
+                {/* Layout Selection - Visual Grid Cards */}
                 <div>
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                    <div className="space-y-2">
-                      <Label>Layout</Label>
-                      <Select value={file.imageLayout.type} onValueChange={(v) => updateFileDetails(file.id, { imageLayout: { ...file.imageLayout, type: v as any } })}>
-                        <SelectTrigger className="bg-white"><SelectValue placeholder="Select a layout" /></SelectTrigger>
-                        <SelectContent>
-                          {layoutOptions.map(opt => (
-                            <SelectItem key={opt.value} value={opt.value}>{opt.label}</SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                    </div>
-                    <div className="space-y-2">
-                        <Label className="font-medium text-sm">Copies</Label>
-                        <div className="flex items-center gap-1">
-                            <Button variant="outline" size="icon" className="h-10 w-10 bg-white" onClick={() => updateFileDetails(file.id, { copies: Math.max(1, file.copies - 1) })}><Minus className="w-4 h-4" /></Button>
-                            <Input value={`${file.copies}`} className="w-20 h-10 text-center bg-white font-medium" onChange={(e) => updateFileDetails(file.id, { copies: parseInt(e.target.value) || 1 })} />
-                            <Button variant="outline" size="icon" className="h-10 w-10 bg-white" onClick={() => updateFileDetails(file.id, { copies: file.copies + 1 })}><Plus className="w-4 h-4" /></Button>
-                        </div>
+                  <div className="flex items-center justify-between mb-3">
+                    <div>
+                      <Label className="font-semibold">Layout</Label>
+                      <p className="text-xs text-muted-foreground">How many photos per page</p>
                     </div>
                   </div>
-                  <div className="space-y-2 mt-4">
-                    <Label>Orientation</Label>
-                    <RadioGroup value={file.orientation} onValueChange={(v) => updateFileDetails(file.id, { orientation: v as any })} className="mt-2 grid grid-cols-2 gap-4">
-                      <Label htmlFor={`portrait-${file.id}`} className={cn("border rounded-md p-4 flex flex-col items-center justify-center gap-2 cursor-pointer transition-colors", file.orientation === 'portrait' ? 'bg-primary/20 border-primary ring-2 ring-primary' : 'bg-white hover:bg-gray-50')}>
-                        <RadioGroupItem value="portrait" id={`portrait-${file.id}`} className="sr-only"/>
-                        <div className="w-10 h-14 border-2 border-dashed rounded" />
-                        <span>Portrait</span>
+                  <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2">
+                    {layoutOptions.map(opt => {
+                      const isSelected = file.imageLayout.type === opt.value;
+                      const cols = file.orientation === 'portrait' ? opt.grid[0] : opt.grid[1];
+                      const rows = file.orientation === 'portrait' ? opt.grid[1] : opt.grid[0];
+                      return (
+                        <button
+                          key={opt.value}
+                          type="button"
+                          onClick={() => { updateFileDetails(file.id, { imageLayout: { ...file.imageLayout, type: opt.value } }); setPreviewPages(prev => ({ ...prev, [file.id]: 0 })); }}
+                          className={cn(
+                            "border-2 rounded-xl p-3 text-center cursor-pointer transition-all",
+                            isSelected ? "border-primary bg-primary/10 shadow-sm ring-1 ring-primary" : "border-gray-200 bg-white hover:border-gray-300 hover:bg-gray-50"
+                          )}
+                        >
+                          <div
+                            className="grid gap-0.5 mx-auto mb-2"
+                            style={{
+                              gridTemplateColumns: `repeat(${Math.min(cols, 4)}, 1fr)`,
+                              gridTemplateRows: `repeat(${Math.min(rows, 4)}, 1fr)`,
+                              width: 56,
+                              height: 68,
+                            }}
+                          >
+                            {Array.from({ length: Math.min(opt.photosPerPage, 16) }).map((_, i) => (
+                              <div key={i} className={cn("rounded-sm", isSelected ? "bg-primary/30" : "bg-gray-300")} />
+                            ))}
+                          </div>
+                          <div className="text-sm font-medium leading-tight">{opt.label}</div>
+                          <div className="text-[10px] text-muted-foreground leading-tight">{opt.subtitle}</div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* Orientation + Fit in a row */}
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                  {/* Orientation */}
+                  <div>
+                    <Label className="font-semibold">Orientation</Label>
+                    <p className="text-xs text-muted-foreground mb-2">Page orientation for this file</p>
+                    <RadioGroup value={file.orientation} onValueChange={(v) => { updateFileDetails(file.id, { orientation: v as any }); setPreviewPages(prev => ({ ...prev, [file.id]: 0 })); }} className="grid grid-cols-3 gap-2">
+                      <Label htmlFor={`auto-${file.id}`} className={cn("border-2 rounded-lg p-3 flex flex-col items-center justify-center gap-1.5 cursor-pointer transition-all", file.orientation === 'auto' ? 'border-primary bg-primary/10 ring-1 ring-primary' : 'border-gray-200 bg-white hover:border-gray-300')}>
+                        <RadioGroupItem value="auto" id={`auto-${file.id}`} className="sr-only" />
+                        <Settings2 className="w-5 h-5 text-muted-foreground" />
+                        <span className="text-sm font-medium">Auto</span>
+                        <span className="text-[10px] text-muted-foreground leading-tight">Match photo</span>
                       </Label>
-                      <Label htmlFor={`landscape-${file.id}`} className={cn("border rounded-md p-4 flex flex-col items-center justify-center gap-2 cursor-pointer transition-colors", file.orientation === 'landscape' ? 'bg-primary/20 border-primary ring-2 ring-primary' : 'bg-white hover:bg-gray-50')}>
-                        <RadioGroupItem value="landscape" id={`landscape-${file.id}`} className="sr-only"/>
-                        <div className="w-14 h-10 border-2 border-dashed rounded" />
-                        <span>Landscape</span>
+                      <Label htmlFor={`portrait-${file.id}`} className={cn("border-2 rounded-lg p-3 flex flex-col items-center justify-center gap-1.5 cursor-pointer transition-all", file.orientation === 'portrait' ? 'border-primary bg-primary/10 ring-1 ring-primary' : 'border-gray-200 bg-white hover:border-gray-300')}>
+                        <RadioGroupItem value="portrait" id={`portrait-${file.id}`} className="sr-only" />
+                        <div className="w-7 h-10 border-2 border-current rounded" />
+                        <span className="text-sm font-medium">Portrait</span>
+                        <span className="text-[10px] text-muted-foreground leading-tight">Tall page</span>
+                      </Label>
+                      <Label htmlFor={`landscape-${file.id}`} className={cn("border-2 rounded-lg p-3 flex flex-col items-center justify-center gap-1.5 cursor-pointer transition-all", file.orientation === 'landscape' ? 'border-primary bg-primary/10 ring-1 ring-primary' : 'border-gray-200 bg-white hover:border-gray-300')}>
+                        <RadioGroupItem value="landscape" id={`landscape-${file.id}`} className="sr-only" />
+                        <div className="w-10 h-7 border-2 border-current rounded" />
+                        <span className="text-sm font-medium">Landscape</span>
+                        <span className="text-[10px] text-muted-foreground leading-tight">Wide page</span>
                       </Label>
                     </RadioGroup>
                   </div>
-                  <div className="flex items-center space-x-2 mt-4">
-                    <Checkbox id={`fit-${file.id}`} checked={file.imageLayout.fit === 'contain'} onCheckedChange={(checked) => updateFileDetails(file.id, { imageLayout: { ...file.imageLayout, fit: checked ? 'contain' : 'cover' } })} />
-                    <Label htmlFor={`fit-${file.id}`}>Fit picture to frame (prevents cropping)</Label>
+
+                  {/* Fit Mode */}
+                  <div>
+                    <Label className="font-semibold">Image Fit</Label>
+                    <p className="text-xs text-muted-foreground mb-2">How photos fill their frame</p>
+                    <RadioGroup value={file.imageLayout.fit} onValueChange={(v) => updateFileDetails(file.id, { imageLayout: { ...file.imageLayout, fit: v as any } })} className="grid grid-cols-2 gap-2">
+                      <Label htmlFor={`contain-${file.id}`} className={cn("border-2 rounded-lg p-3 flex items-start gap-3 cursor-pointer transition-all h-full", file.imageLayout.fit === 'contain' ? 'border-primary bg-primary/10 ring-1 ring-primary' : 'border-gray-200 bg-white hover:border-gray-300')}>
+                        <RadioGroupItem value="contain" id={`contain-${file.id}`} className="sr-only" />
+                        <div className="w-10 h-10 bg-gray-100 rounded flex items-center justify-center flex-shrink-0 mt-0.5">
+                          <div className="w-6 h-6 bg-gray-400 rounded-sm" />
+                        </div>
+                        <div className="text-left">
+                          <div className="text-sm font-medium">Fit</div>
+                          <div className="text-[10px] text-muted-foreground leading-tight">Whole photo visible, may have white borders</div>
+                        </div>
+                      </Label>
+                      <Label htmlFor={`cover-${file.id}`} className={cn("border-2 rounded-lg p-3 flex items-start gap-3 cursor-pointer transition-all h-full", file.imageLayout.fit === 'cover' ? 'border-primary bg-primary/10 ring-1 ring-primary' : 'border-gray-200 bg-white hover:border-gray-300')}>
+                        <RadioGroupItem value="cover" id={`cover-${file.id}`} className="sr-only" />
+                        <div className="w-10 h-10 bg-gray-100 rounded flex items-center justify-center flex-shrink-0 mt-0.5 overflow-hidden">
+                          <div className="w-8 h-8 bg-gray-400 rounded-sm flex-shrink-0" />
+                        </div>
+                        <div className="text-left">
+                          <div className="text-sm font-medium">Cover</div>
+                          <div className="text-[10px] text-muted-foreground leading-tight">Fills the frame, edges may be cropped</div>
+                        </div>
+                      </Label>
+                    </RadioGroup>
                   </div>
                 </div>
-                <div className="bg-gray-200 rounded-lg flex items-center justify-center p-4 relative">
-                  <div className={cn("bg-white shadow-lg rounded-md w-full relative", file.orientation === 'portrait' ? "aspect-[210/297]" : "aspect-[297/210]")}>
-                    <div
-                      className="grid gap-0.5 p-0.5 h-full w-full"
-                      style={{
-                        gridTemplateColumns: `repeat(${file.orientation === 'portrait' ? (layoutOptions.find(l => l.value === file.imageLayout.type)?.grid[0] || 1) : (layoutOptions.find(l => l.value === file.imageLayout.type)?.grid[1] || 1)}, 1fr)`,
-                        gridTemplateRows: `repeat(${file.orientation === 'portrait' ? (layoutOptions.find(l => l.value === file.imageLayout.type)?.grid[1] || 1) : (layoutOptions.find(l => l.value === file.imageLayout.type)?.grid[0] || 1)}, 1fr)`,
-                      }}
-                    >
-                      {Array.from({ length: Math.min(file.copies, file.imageLayout.photosPerPage) }).map((_, i) => (
-                        <div key={i} className="bg-gray-100 flex items-center justify-center overflow-hidden relative">
-                          {file.previewUrl && (
-                            <Image
-                              src={file.previewUrl}
-                              alt="preview"
-                              fill
-                              className={cn("h-full w-full", file.imageLayout.fit === 'contain' ? 'object-contain' : 'object-cover')}
-                            />
+
+                {/* Print Preview */}
+                {(() => {
+                  const layout = layoutOptions.find(l => l.value === file.imageLayout.type)!;
+                  const cols = file.orientation === 'portrait' ? layout.grid[0] : layout.grid[1];
+                  const rows = file.orientation === 'portrait' ? layout.grid[1] : layout.grid[0];
+                  const totalPages = Math.ceil(file.imageFiles.length / layout.photosPerPage);
+                  const currentPage = previewPages[file.id] || 0;
+                  const startIdx = currentPage * layout.photosPerPage;
+                  const pageImages = file.imageFiles.slice(startIdx, startIdx + layout.photosPerPage);
+                  return (
+                    <div>
+                      <div className="flex items-center justify-between mb-3">
+                        <Label className="font-semibold">Print Preview</Label>
+                        <span className="text-xs text-muted-foreground tabular-nums">
+                          {file.imageFiles.length} photo{file.imageFiles.length !== 1 ? 's' : ''} &middot; {totalPages} page{totalPages !== 1 ? 's' : ''} &middot; {file.copies} cop{file.copies > 1 ? 'ies' : 'y'}
+                        </span>
+                      </div>
+                      <div className="bg-gray-100 rounded-xl p-4 md:p-6 overflow-auto">
+                        <div className="flex flex-col items-center gap-4">
+                          <div className={cn(
+                            "bg-white shadow-lg rounded-md relative flex-shrink-0",
+                            file.orientation === 'portrait' ? "w-full max-w-[280px] aspect-[210/297]" : "w-full max-w-[360px] aspect-[297/210]"
+                          )}>
+                            <div className="absolute inset-[8%]">
+                              <div
+                                className="grid h-full w-full gap-px"
+                                style={{
+                                  gridTemplateColumns: `repeat(${cols}, 1fr)`,
+                                  gridTemplateRows: `repeat(${rows}, 1fr)`,
+                                }}
+                              >
+                                {Array.from({ length: Math.min(pageImages.length, layout.photosPerPage) }).map((_, i) => {
+                                  const img = pageImages[i];
+                                  return (
+                                    <div key={i} className="bg-gray-50 flex items-center justify-center overflow-hidden relative rounded-sm border border-gray-100">
+                                      {img?.previewUrl ? (
+                                        <Image
+                                          src={img.previewUrl}
+                                          alt=""
+                                          fill
+                                          className={file.imageLayout.fit === 'contain' ? 'object-contain p-0.5' : 'object-cover'}
+                                        />
+                                      ) : (
+                                        <div className="w-full h-full flex items-center justify-center">
+                                          <Loader2 className="w-4 h-4 animate-spin text-gray-400" />
+                                        </div>
+                                      )}
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            </div>
+                          </div>
+                          {totalPages > 1 && (
+                            <div className="flex items-center gap-3">
+                              <Button
+                                variant="outline"
+                                size="icon"
+                                className="h-8 w-8 bg-white"
+                                disabled={currentPage === 0}
+                                onClick={() => setPreviewPages(prev => ({ ...prev, [file.id]: currentPage - 1 }))}
+                              >
+                                <ChevronLeft className="h-4 w-4" />
+                              </Button>
+                              <span className="text-sm font-medium min-w-[80px] text-center tabular-nums">
+                                {currentPage + 1} / {totalPages}
+                              </span>
+                              <Button
+                                variant="outline"
+                                size="icon"
+                                className="h-8 w-8 bg-white"
+                                disabled={currentPage >= totalPages - 1}
+                                onClick={() => setPreviewPages(prev => ({ ...prev, [file.id]: currentPage + 1 }))}
+                              >
+                                <ChevronRight className="h-4 w-4" />
+                              </Button>
+                            </div>
                           )}
                         </div>
-                      ))}
+                      </div>
                     </div>
-                  </div>
-                </div>
+                  );
+                })()}
               </div>
             ) : (
               // DOCUMENT LAYOUT
@@ -1021,10 +1400,11 @@ export function OrderForm({ initialPrinters, currentStep, setStep }: OrderFormPr
                 <div className="border rounded-lg bg-white divide-y">
                     {filesReadyForConfig.map((file, index) => {
                         const assignment = fileAssignments.get(file.id);
+                        const fileName = file.isGroup ? `Image Collage (${file.imageFiles.length} photos)` : file.originalFile!.name;
                         return (
                         <div key={file.id} className={cn("p-3 flex flex-col md:flex-row justify-between items-start md:items-center text-sm gap-2", index % 2 === 0 ? "bg-blue-50/50" : "bg-yellow-50/50")}>
                             <div className='flex-1'>
-                                <p className="font-medium truncate pr-4"><span className="font-bold mr-2">{index+1}.</span>{file.originalFile.name}</p>
+                                <p className="font-medium truncate pr-4"><span className="font-bold mr-2">{index+1}.</span>{fileName}</p>
                                 <div className='md:hidden mt-2 flex items-center gap-2'>
                                     {assignment?.printerName ? (
                                         <Badge variant="secondary" className="flex items-center gap-1.5">
@@ -1151,7 +1531,7 @@ export function OrderForm({ initialPrinters, currentStep, setStep }: OrderFormPr
                                     <div key={index} className="flex items-center justify-between text-sm">
                                         <p className="flex items-center gap-2">
                                             {file.isImageFile ? <ImageIcon className="w-4 h-4 text-muted-foreground"/> : <FileUp className="w-4 h-4 text-muted-foreground"/>}
-                                            {file.originalFileName}
+                                            {file.isGroup ? `Image Collage (${file.imageFiles?.length} photos)` : file.originalFileName}
                                         </p>
                                         <p className="text-muted-foreground">{file.copies}x</p>
                                     </div>

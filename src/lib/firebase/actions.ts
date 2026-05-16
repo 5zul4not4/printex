@@ -4,10 +4,9 @@
 import { collection, addDoc, serverTimestamp, doc, getDoc, setDoc, updateDoc, getDocs, writeBatch, query, orderBy, limit } from "firebase/firestore";
 import { db } from "./config";
 import type { PrintJob, Printer, Pricing, PaperSizes } from "@/lib/types";
-import { GoogleAuth } from 'google-auth-library';
-import { google } from 'googleapis';
 import Razorpay from 'razorpay';
 import crypto from 'crypto';
+import { v4 as uuidv4 } from 'uuid';
 
 const defaultPricing: Pricing = {
   bwA4First10Pages: 10,
@@ -36,87 +35,30 @@ const defaultPaperSizes: PaperSizes = {
     A4: true,
 };
 
-const DRIVE_FOLDER_ID = '0AAg0HgehhXVRUk9PVA';
-const DRIVE_SERVICE_ACCOUNT_KEY_PATH = 'driveServiceAccountKey.json';
 const MAX_JOBS_IN_COLLECTION = 1000;
 
+export async function getTelegramUploadUrl(
+  fileName: string
+): Promise<{ success: boolean; uploadUrl?: string; boundary?: string; message?: string }> {
+  const botToken = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
 
-async function getAuth() {
-    const auth = new GoogleAuth({
-        keyFile: DRIVE_SERVICE_ACCOUNT_KEY_PATH,
-        scopes: ['https://www.googleapis.com/auth/drive'],
-    });
-    return auth;
-}
+  if (!botToken || !chatId) {
+    return { success: false, message: 'Telegram Bot is not configured on the server.' };
+  }
 
-export async function getGoogleDriveUploadUrl(fileName: string, mimeType: string, origin: string): Promise<{ success: boolean; uploadUrl?: string; uniqueFileName?: string; message?: string }> {
-    try {
-        const auth = await getAuth();
-        const accessToken = await auth.getAccessToken();
+  try {
+    const boundary = `----WebKitFormBoundary${uuidv4().replace(/-/g, '')}`;
+    const telegramApiUrl = `https://api.telegram.org/bot${botToken}/sendDocument?chat_id=${chatId}`;
+    
+    // We are just preparing the URL and boundary for the client to use.
+    // The client will construct the body and perform the actual upload.
+    return { success: true, uploadUrl: telegramApiUrl, boundary };
 
-        // Create a unique name that the local connector can find.
-        const uniqueFileName = `${new Date().toISOString().replace(/[:.]/g, '-')}_${fileName}`;
-
-        const fileMetadata = {
-            name: uniqueFileName,
-            parents: [DRIVE_FOLDER_ID],
-        };
-        
-        const res = await fetch(`https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&supportsAllDrives=true`, {
-            method: 'POST',
-            headers: {
-                'Authorization': `Bearer ${accessToken}`,
-                'Content-Type': 'application/json; charset=UTF-8',
-                'X-Upload-Content-Type': mimeType,
-                 'Origin': origin,
-            },
-            body: JSON.stringify(fileMetadata),
-        });
-        
-        if (!res.ok) {
-            const errorText = await res.text();
-            console.error('Google Drive resumable init failed:', errorText);
-            throw new Error(`Failed to create resumable session: ${res.status} ${errorText}`);
-        }
-        
-        const location = res.headers.get('Location');
-        if (!location) {
-            throw new Error('Could not get resumable upload URL (Location header) from Google Drive.');
-        }
-
-        return { success: true, uploadUrl: location, uniqueFileName: uniqueFileName };
-
-    } catch (e: any) {
-        console.error("Error getting Google Drive upload URL:", e);
-        return { success: false, message: e.message || 'Could not get Google Drive upload URL.' };
-    }
-}
-
-export async function getDriveFileIdByName(uniqueFileName: string): Promise<{ success: boolean; fileId?: string; message?: string }> {
-    try {
-        const auth = await getAuth();
-        const drive = google.drive({ version: 'v3', auth });
-
-        const res = await drive.files.list({
-            q: `name='${uniqueFileName}' and '${DRIVE_FOLDER_ID}' in parents and trashed=false`,
-            fields: 'files(id)',
-            supportsAllDrives: true,
-            includeItemsFromAllDrives: true,
-        });
-
-        if (res.data.files && res.data.files.length > 0) {
-            const fileId = res.data.files[0].id;
-            if (fileId) {
-                return { success: true, fileId: fileId };
-            }
-        }
-        
-        throw new Error(`File '${uniqueFileName}' not found in Drive after upload.`);
-
-    } catch (e: any) {
-        console.error("Error getting Google Drive file ID by name:", e);
-        return { success: false, message: e.message || 'Could not get Google Drive file ID.' };
-    }
+  } catch (e: any) {
+    console.error("Error preparing Telegram upload URL:", e);
+    return { success: false, message: e.message || 'Could not prepare Telegram upload URL.' };
+  }
 }
 
 
@@ -308,18 +250,17 @@ export async function updatePrinterCapabilities(printerId: string, capabilities:
     }
 }
 
-export async function getPageCountForWordFile(googleDriveFileId: string, uniqueFileName: string): Promise<{success: boolean; jobId?: string; message?: string}> {
+export async function getPageCountForWordFile(telegramFileId: string, originalFileName: string): Promise<{success: boolean; jobId?: string; message?: string}> {
     try {
         const jobData: Partial<PrintJob> = {
             orderType: 'page-count-request',
             status: 'page-count-request',
-            files: [], // Not needed for this request type, but good to have
+            files: [],
             cost: 0,
             username: 'page-count-service',
             orderId: 'page-count-service',
-            // Add the specific fields for this job type
-            fileName: uniqueFileName,
-            googleDriveFileId: googleDriveFileId,
+            googleDriveFileId: telegramFileId, // Reusing field for Telegram file_id
+            fileName: originalFileName, // Storing the original file name
         };
         const creationResult = await createPrintJob(jobData as any);
         if (!creationResult.success || !creationResult.id) {
@@ -410,7 +351,7 @@ export async function createRazorpayOrder(amount: number, currency: string, rece
             currency,
             receipt: receiptId,
             notes: {
-                'project': 'PrintEase'
+                'project': 'PrintEx'
             }
         };
 
@@ -448,18 +389,21 @@ export async function verifyRazorpayPayment(razorpay_order_id: string, razorpay_
 }
 
 
-export async function updatePrintJobsWithPayment(jobIds: string[], paymentId: string, razorpayOrderId: string): Promise<{ success: boolean; message?: string }> {
+export async function updatePrintJobsWithPayment(jobIds: string[], paymentId: string, razorpayOrderId: string, status: PrintJob['status'] = 'ready'): Promise<{ success: boolean; message?: string }> {
     try {
         const batch = writeBatch(db);
         for (const jobId of jobIds) {
             const jobRef = doc(db, "print_jobs", jobId);
-            batch.update(jobRef, {
-                status: 'ready',
+            const updateData: any = {
+                status: status,
                 paymentId: paymentId,
                 razorpayOrderId: razorpayOrderId,
-                paymentMethod: 'upi',
-                paymentTime: serverTimestamp()
-            });
+            };
+            if (status === 'ready') {
+                updateData.paymentMethod = 'upi';
+                updateData.paymentTime = serverTimestamp();
+            }
+            batch.update(jobRef, updateData);
         }
         await batch.commit();
         return { success: true };

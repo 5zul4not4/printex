@@ -8,10 +8,19 @@ export interface ImageLayout {
   fit: 'contain' | 'cover';
 }
 
+export interface ImageFile {
+  originalFileName: string;
+  uniqueFileName: string;
+  googleDriveFileId: string;
+}
+
 export interface FileInJob {
-  fileName: string; // The *unique* file name used for upload
-  originalFileName: string; // The original user-facing file name
-  googleDriveFileId: string; // The final, real GDrive ID
+  isGroup: boolean;
+  imageFiles?: ImageFile[]; // For grouped images
+
+  fileName: string; // The *unique* file name used for upload OR a collage identifier
+  originalFileName: string; // The original user-facing file name OR "Image Collage"
+  googleDriveFileId: string; // The final, real GDrive ID OR 'group'
   isWordFile: boolean;
   isImageFile: boolean;
   pageCount: number;
@@ -19,7 +28,7 @@ export interface FileInJob {
   copies: number;
   printType: 'bw' | 'color';
   paperSize: 'A4' | 'A3' | 'A2' | 'A1' | 'A0';
-  orientation: 'portrait' | 'landscape';
+  orientation: 'portrait' | 'landscape' | 'auto';
   duplex: 'one-sided' | 'duplex-long-edge' | 'duplex-short-edge';
   imageLayout?: ImageLayout;
 }
@@ -27,7 +36,7 @@ export interface FileInJob {
 export interface PrintJob {
   id: string;
   orderType: OrderType;
-  status: 'pending-payment' | 'pending' | 'uploading' | 'ready' | 'printing' | 'completed' | 'error' | 'page-count-request' | 'page-count-completed' | 'reprint' | 'reprint-completed';
+  status: 'pending-payment' | 'pending' | 'uploading' | 'ready' | 'printing' | 'completed' | 'error' | 'page-count-request' | 'page-count-completed' | 'reprint' | 'reprint-completed' | 'cancelled';
   createdAt: any; // Firestore Timestamp
   printerId: string;
   name: string; // Printer Name
@@ -105,3 +114,5 @@ export interface Pricing {
   // Edit Fee
   editFee: number;
 }
+
+    

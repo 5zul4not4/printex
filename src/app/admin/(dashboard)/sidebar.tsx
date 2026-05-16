@@ -52,7 +52,7 @@ export function AdminSidebar({ children }: { children: ReactNode }) {
               <div className="bg-primary/20 p-2 rounded-lg">
                 <Printer className="w-6 h-6 text-primary" />
               </div>
-              <h1 className="text-xl font-bold">PrintAdmin</h1>
+              <h1 className="text-xl font-bold">PrintexAdmin</h1>
             </div>
           </SidebarHeader>
           <SidebarContent>
