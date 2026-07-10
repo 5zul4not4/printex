@@ -1,0 +1,16 @@
+{
+  "placeholderImages": [
+    {
+      "id": "hero",
+      "description": "A modern printer in a clean office environment",
+      "imageUrl": "https://images.unsplash.com/photo-1737703425262-e2a9c05c479b?crop=entropy&cs=tinysrgb&fit=max&fm=jpg&ixid=M3w3NDE5ODJ8MHwxfHNlYXJjaHw2fHxtb2Rlcm4lMjBwcmludGVyfGVufDB8fHx8MTc1ODk2Mzc1M3ww&ixlib=rb-4.1.0&q=80&w=1080",
+      "imageHint": "modern printer"
+    },
+    {
+      "id": "admin-avatar",
+      "description": "Avatar for an admin user",
+      "imageUrl": "https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?crop=entropy&cs=tinysrgb&fit=max&fm=jpg&ixid=M3w3NDE5ODJ8MHwxfHNlYXJjaHw3fHxwZXJzb24lMjBwb3J0cmFpdHxlbnwwfHx8fDE3NTg5MDE5MzN8MA&ixlib=rb-4.1.0&q=80&w=1080",
+      "imageHint": "person portrait"
+    }
+  ]
+}

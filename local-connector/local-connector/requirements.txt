@@ -1,0 +1,10 @@
+firebase-admin
+pywin32
+requests
+google-cloud-firestore
+Pillow
+pillow-heif
+pypdf
+python-docx
+python-dotenv
+websocket-client

@@ -1,72 +1,104 @@
-# PrintEx Local Connector Agent (Python)
+# PrintEx — Cloud-Backed Print Shop System
 
-This document provides instructions for setting up the Python-based Local Connector Agent, which runs on the print shop's Windows PC. This script is the bridge between your online application and your physical printers.
+This is a Next.js application for "PrintEx", a cloud-backed print shop system. It includes a user-facing app (Print-X), an admin panel (PrintExAdmin), and a backend built with Next.js.
 
-## 1. Purpose
+## Overview
 
-The Local Connector's primary responsibilities are:
-- **Connecting to Firebase**: Securely authenticates with your Firebase project.
-- **Printer Management**: Detects all printers installed on the Windows machine and reports them to the Firestore `printers` collection so they appear in your admin dashboard.
-- **Job Polling**: Actively polls for new print jobs in the `print_jobs` collection that have a `status` of `ready`.
-- **File Downloading**: Downloads the print job file from Google Drive.
-- **Printing**: Spools the document to the correct local printer using `SumatraPDF`.
-- **Status Updates**: Updates the job's status in Firestore from `ready` -> `printing` -> `completed` or `error`.
+PrintEx allows customers to upload documents, get instant page counts, pay for print jobs, and have them automatically printed at a local print shop. The admin panel provides tools for managing printers, jobs, pricing, and viewing reports.
 
-## 2. Setup Instructions
+### Core Features
+
+*   **PDF Upload and Instant Page Count**: Users can upload PDF files and see the page count immediately, calculated on the client-side.
+*   **UPI Payment Integration**: A seamless payment flow using UPI, integrated with a payment gateway (in sandbox mode).
+*   **Automated Print Queue**: Paid jobs are automatically added to a print queue in Firestore.
+*   **Local Connector Agent**: A script (to be run on the shop's PC) listens for new jobs and prints them automatically.
+*   **Admin Dashboard**: A comprehensive interface for admins to manage the print shop's operations.
+*   **AI-Powered Edit Summary**: An AI-powered feature to summarize changes made by an admin during an "Edit & Print" job.
+
+## Getting Started
 
 ### Prerequisites
-- A Windows PC (Windows 7/10/11) with printers installed.
-- Python 3.8 or newer installed. Download it from [python.org](https://www.python.org/downloads/).
-- **SumatraPDF** must be installed. This is a lightweight, free PDF viewer that is excellent for silent printing via command line. Download it from [sumatrapdfreader.org](https://www.sumatrapdfreader.org/free-pdf-reader).
 
-### 2.1. Firebase & Google Drive Service Account Keys
+*   Node.js (v18 or later)
+*   npm, yarn, or pnpm
+*   Firebase Project (for Firestore and Storage)
 
-This project directory should already contain two critical `.json` key files. These were generated when the project was set up.
-1.  `serviceAccountKey.json`: For connecting to Firebase Firestore.
-2.  `driveServiceAccountKey.json`: For connecting to Google Drive to download files.
+### Environment Variables
 
-**IMPORTANT**: These files contain sensitive credentials. Do not share them or commit them to public version control.
+Create a `.env.local` file in the root of the project and add your Firebase configuration:
 
-### 2.2. Python Environment Installation
+```
+NEXT_PUBLIC_FIREBASE_API_KEY=
+NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN=
+NEXT_PUBLIC_FIREBASE_PROJECT_ID=
+NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET=
+NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID=
+NEXT_PUBLIC_FIREBASE_APP_ID=
 
-1.  **Open Command Prompt or PowerShell** on the Windows PC.
-2.  **Navigate to this directory**:
-    ```sh
-    cd path\to\your\project\local-connector
-    ```
-3.  **Create a virtual environment** (recommended to keep dependencies isolated):
-    ```sh
-    python -m venv venv
-    ```
-4.  **Activate the virtual environment**:
-    ```sh
-    .\venv\Scripts\activate
-    ```
-5.  **Install the required Python libraries**:
-    Run the following command to install all necessary packages from the `requirements.txt` file:
-    ```sh
-    pip install -r requirements.txt
-    ```
-
-## 3. Running the Agent
-
-To run the agent, simply execute the Python script from your terminal (with the virtual environment activated):
-
-```sh
-python local_connector.py
+# For Genkit AI features
+GOOGLE_API_KEY=
 ```
 
-The script will start, initialize Firebase and Google Drive services, report the printers it finds on the PC, and begin polling for jobs. You will see log messages in the console as it works.
+### Installation
 
-For production use, you should consider running this script as a Windows Service or a scheduled task to ensure it's always running in the background.
+1.  Clone the repository.
+2.  Install dependencies:
+    ```bash
+    npm install
+    ```
+3.  Run the development server:
+    ```bash
+    npm run dev
+    ```
 
----
+The application will be available at `http://localhost:9002`.
+*   User App: `http://localhost:9002`
+*   Admin Panel: `http://localhost:9002/admin`
 
-### How it all works together:
+## Deployment (Going Public)
 
-1.  A **customer** visits your deployed website and places a print order.
-2.  The Next.js app creates a `print_job` document in Firestore with a status of `ready`.
-3.  The **`local_connector.py` script**, running on your shop's PC, sees this new job.
-4.  The script downloads the file and sends it to the physical printer.
-5.  The script updates the job's status to `completed`.
-6.  You, the **admin**, can see the updated status on your dashboard.
+To make your application accessible to anyone on the internet, you need to deploy it. Since this is a Next.js application using Firebase, the recommended method is **Firebase App Hosting**.
+
+1.  **Install Firebase CLI:** If you haven't already, install the Firebase Command Line Interface globally.
+    ```bash
+    npm install -g firebase-tools
+    ```
+
+2.  **Login to Firebase:**
+    ```bash
+    firebase login
+    ```
+
+3.  **Initialize Hosting:** In your project root, run the init command.
+    ```bash
+    firebase init hosting
+    ```
+    Follow the prompts, select your project, and choose "App Hosting" as the hosting type.
+
+4.  **Deploy:** This command will build your Next.js app and upload it to Firebase's global servers.
+    ```bash
+    firebase deploy
+    ```
+
+After deployment, you will get a public URL (e.g., `https://your-project-id.web.app`). This is your live website.
+
+### Is it free to deploy? (Blaze Plan Explained)
+
+Yes, you can get started for free. However, Firebase App Hosting **requires your project to be on the Blaze (pay-as-you-go) plan**. Here's what that means:
+
+*   **Why is Blaze required?** App Hosting uses advanced Google Cloud services that require a billing account to be enabled.
+*   **You Still Get the Free Tier:** The Blaze plan **includes the same generous free tier** as the free Spark plan. You do not pay anything until your usage *exceeds* the free limits.
+*   **Conclusion:** For a new application like this, you will almost certainly stay within the free tier and incur **no costs**. You only need to upgrade to Blaze to enable the feature, but your bill will be $0 until your app's usage grows significantly.
+
+## Local Connector Agent
+
+The local connector is a crucial part of the system that runs on the print shop's Windows PC. It connects to Firebase, listens for print jobs, and sends them to the local printers. **This script is not deployed to the cloud.**
+
+For detailed instructions on setting up and running the agent, please refer to the `local-connector/README.md` file.
+
+## Testing
+
+*   **Page Counting**: Upload a PDF on the order page to see the instant page count.
+*   **Payment Flow**: The payment flow is currently mocked. Clicking "Pay" will simulate a successful payment and queue the job.
+*   **Admin Panel**: Navigate to `/admin` to access the admin dashboard. Note that authentication is not implemented in this version.
+*   **AI Summary**: In the admin panel, go to "Edit Requests", open a request, and use the "Summarize Changes" tool to test the AI feature.
