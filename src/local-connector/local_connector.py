@@ -8,7 +8,8 @@ import datetime
 import subprocess
 import re
 import sys
-import receiver
+import requests  # For Telegram downloads
+import io
 
 try:
     from PyPDF2 import PdfReader, PdfWriter
@@ -32,9 +33,12 @@ import pythoncom  # Required for multithreading COM objects
 FIREBASE_SERVICE_ACCOUNT_KEY_PATH = "serviceAccountKey.json"
 TEMP_DIR = "printed_jobs"
 PRINTER_REFRESH_INTERVAL = 20  # seconds
-CONNECTOR_PORT = 9876  # HTTP file receiver port
-RELAY_URL = os.getenv("RELAY_URL", "ws://localhost:9786")
-FILE_WAIT_TIMEOUT = 300  # max seconds to wait for a file to arrive on disk
+
+# --- TELEGRAM CREDENTIALS ---
+# IMPORTANT: Replace these placeholder values with your actual credentials.
+TELEGRAM_BOT_TOKEN = "8384966768:AAHgEWSUd-tpLy7nMpzUsxkJ7D13E4FpuXU"
+TELEGRAM_CHAT_ID = "-1003690901983"
+# ----------------------------
 
 # A4 paper size in inches for layout calculations
 A4_WIDTH_IN = 8.27
@@ -77,9 +81,7 @@ def update_printers_in_firestore():
     """
     Updates the status, queue length, and estimated wait time for each
     printer managed by this connector instance.
-    Returns the list of Firestore document IDs for managed printers.
     """
-    managed_ids = []
     try:
         printer_names = get_installed_printers()
         printers_ref = db.collection("printers")
@@ -87,7 +89,6 @@ def update_printers_in_firestore():
 
         for name in printer_names:
             printer_doc_id = sanitize_for_firestore_id(name)
-            managed_ids.append(printer_doc_id)
 
             # Get the current queue length for this specific printer
             try:
@@ -143,30 +144,47 @@ def update_printers_in_firestore():
 
     except Exception as e:
         print(f"⚠️ Could not update printers in Firestore: {e}")
-    return managed_ids
 
 
 # === FILE PROCESSING & PRINTING ===
-def wait_for_file(file_path, timeout=FILE_WAIT_TIMEOUT):
-    """Wait for a file to appear on disk (from the receiver module)."""
-    start = time.time()
-    while not os.path.exists(file_path):
-        if time.time() - start > timeout:
-            raise Exception(f"File not found after waiting {timeout}s: {file_path}")
-        time.sleep(1)
-    return file_path
+def download_file(file_id, local_path):
+    """Downloads a file from Telegram using its file_id."""
+    if not TELEGRAM_BOT_TOKEN:
+        raise Exception("Telegram Bot Token not configured for download.")
 
+    try:
+        print(f"⬇️  Requesting file path from Telegram for file_id: {file_id}")
 
-def resolve_file_path(stream_session_id, original_file_name):
-    """Resolve the local file path for a stream session's received file."""
-    if (
-        not stream_session_id
-        or stream_session_id == "none"
-        or stream_session_id == "group"
-    ):
-        raise Exception(f"Invalid streamSessionId: {stream_session_id}")
-    file_path = os.path.join(TEMP_DIR, stream_session_id, original_file_name)
-    return wait_for_file(file_path)
+        # 1. Get the file path from the file_id
+        get_file_path_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile"
+        response = requests.get(get_file_path_url, params={"file_id": file_id})
+        response.raise_for_status()
+
+        file_path_data = response.json()
+        if not file_path_data.get("ok"):
+            raise Exception(
+                f"Telegram getFile failed: {file_path_data.get('description', 'Unknown error')}"
+            )
+
+        file_path_on_server = file_path_data["result"]["file_path"]
+
+        # 2. Download the file using the path
+        download_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path_on_server}"
+        print(f"⬇️  Downloading from Telegram...")
+
+        with requests.get(download_url, stream=True) as r:
+            r.raise_for_status()
+            with open(local_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+
+        print(f"✅ File downloaded successfully to '{os.path.basename(local_path)}'")
+        return local_path
+
+    except requests.exceptions.RequestException as e:
+        raise Exception(f"Network error during Telegram download: {e}")
+    except Exception as e:
+        raise Exception(f"Failed during file download from Telegram: {e}")
 
 
 def create_image_layout_pdf(
@@ -469,20 +487,26 @@ def parse_page_range(range_str, max_pages):
 def process_page_count_request(job_id, job_data):
     print(f"\n--- Processing page count request {job_id} ---")
     job_ref = db.collection("print_jobs").document(job_id)
+    local_file_path = None
+    pdf_path = None
     word = None
 
     try:
         pythoncom.CoInitialize()  # Initialize COM for this thread
-        stream_session_id = job_data.get("streamSessionId") or job_data.get("pageCount")
+        file_id = job_data.get(
+            "googleDriveFileId"
+        )  # Re-using this field for Telegram file_id
 
-        if not stream_session_id:
-            raise Exception("Missing streamSessionId in page count request.")
+        if not file_id:
+            raise Exception("Missing File ID in page count request.")
 
+        # Construct a temporary filename using the job ID and original file name
         original_file_name = job_data.get("fileName")
         if not original_file_name:
             raise Exception("Missing original file name in page count request.")
 
-        local_file_path = resolve_file_path(stream_session_id, original_file_name)
+        local_file_path = os.path.join(TEMP_DIR, f"{job_id}_{original_file_name}")
+        download_file(file_id, local_file_path)
 
         word = win32com.client.Dispatch("Word.Application")
         word.Visible = False
@@ -499,6 +523,10 @@ def process_page_count_request(job_id, job_data):
     finally:
         if word:
             word.Quit()
+        if local_file_path and os.path.exists(local_file_path):
+            os.remove(local_file_path)
+        if pdf_path and pdf_path != local_file_path and os.path.exists(pdf_path):
+            os.remove(pdf_path)
         processed_jobs.discard(job_id)
         pythoncom.CoUninitialize()  # Uninitialize COM for this thread
 
@@ -506,6 +534,7 @@ def process_page_count_request(job_id, job_data):
 def process_print_job(job_id, job_data):
     print(f"\n--- Processing print job {job_id} ---")
     job_ref = db.collection("print_jobs").document(job_id)
+    temp_files_to_clean = []
     word = None
 
     try:
@@ -526,6 +555,7 @@ def process_print_job(job_id, job_data):
         if binding in ["spiral", "soft"] and has_documents:
             print("ℹ️ Binding detected. Printing cover page first...")
             cover_page_text_path = os.path.join(TEMP_DIR, f"{job_id}_cover.txt")
+            temp_files_to_clean.append(cover_page_text_path)
 
             with open(cover_page_text_path, "w", encoding="utf-8") as f:
                 f.write("========= PrintEx Order Summary =========\n\n")
@@ -544,6 +574,8 @@ def process_print_job(job_id, job_data):
                     f.write("\n")
 
             cover_pdf_path = convert_to_pdf(cover_page_text_path, word_app=word)
+            if cover_pdf_path != cover_page_text_path:
+                temp_files_to_clean.append(cover_pdf_path)
 
             print_file(
                 printer_name=job_data.get("name"),
@@ -558,6 +590,7 @@ def process_print_job(job_id, job_data):
 
         # --- Individual File Printing Loop ---
         for i, file_info in enumerate(files_to_process):
+            file_specific_temp_files = []
             try:
                 original_file_name = file_info.get("originalFileName", f"file_{i + 1}")
                 is_group = file_info.get("isGroup", False)
@@ -578,24 +611,27 @@ def process_print_job(job_id, job_data):
 
                     image_paths = []
                     for img_idx, img_data in enumerate(image_files_data):
-                        img_session_id = img_data.get("streamSessionId")
-                        if not img_session_id:
-                            raise Exception(
-                                f"Missing streamSessionId for an image in collage."
-                            )
+                        img_file_id = img_data.get(
+                            "googleDriveFileId"
+                        )  # Re-using field for Telegram file_id
+                        if not img_file_id:
+                            raise Exception(f"Missing File ID for an image in collage.")
 
                         img_original_name = img_data.get(
                             "originalFileName", f"image_{img_idx}.jpg"
                         )
-                        img_local_path = resolve_file_path(
-                            img_session_id, img_original_name
+                        img_local_path = os.path.join(
+                            TEMP_DIR, f"{job_id}_{i}_img_{img_idx}_{img_original_name}"
                         )
+                        file_specific_temp_files.append(img_local_path)
+                        download_file(img_file_id, img_local_path)
                         image_paths.append(img_local_path)
 
                     layout_info = file_info.get("imageLayout")
                     collage_pdf_path = os.path.join(
                         TEMP_DIR, f"{job_id}_collage_{i}.pdf"
                     )
+                    file_specific_temp_files.append(collage_pdf_path)
 
                     create_image_layout_pdf(
                         image_paths=image_paths,
@@ -608,17 +644,23 @@ def process_print_job(job_id, job_data):
                     final_pdf_for_this_file = collage_pdf_path
                     copies = 1
                 else:  # Document file
-                    stream_session_id = file_info.get("streamSessionId")
-                    if not stream_session_id:
+                    file_id = file_info.get(
+                        "googleDriveFileId"
+                    )  # Re-using field for Telegram file_id
+                    if not file_id:
                         raise Exception(
-                            f"Missing streamSessionId for file '{original_file_name}'."
+                            f"Missing File ID for file '{original_file_name}'."
                         )
 
-                    local_path = resolve_file_path(
-                        stream_session_id, original_file_name
+                    local_path = os.path.join(
+                        TEMP_DIR, f"{job_id}_{i}_{original_file_name}"
                     )
+                    file_specific_temp_files.append(local_path)
+                    download_file(file_id, local_path)
 
                     converted_pdf_path = convert_to_pdf(local_path, word_app=word)
+                    if converted_pdf_path != local_path:
+                        file_specific_temp_files.append(converted_pdf_path)
 
                     rotated_pdf_path_for_doc = converted_pdf_path
                     # --- Orientation and Rotation Logic for Documents ---
@@ -641,6 +683,7 @@ def process_print_job(job_id, job_data):
                             rotated_pdf_path = os.path.join(
                                 TEMP_DIR, f"{job_id}_{i}_rotated.pdf"
                             )
+                            file_specific_temp_files.append(rotated_pdf_path)
                             writer = PdfWriter()
                             for page in reader.pages:
                                 page.rotate(90)
@@ -660,6 +703,7 @@ def process_print_job(job_id, job_data):
                         subset_pdf_path = os.path.join(
                             TEMP_DIR, f"{job_id}_{i}_subset.pdf"
                         )
+                        file_specific_temp_files.append(subset_pdf_path)
 
                         with open(rotated_pdf_path_for_doc, "rb") as f_in:
                             reader = PdfReader(f_in)
@@ -702,8 +746,13 @@ def process_print_job(job_id, job_data):
                 )
 
             finally:
-                # User requested to keep temp files, so this block is now empty.
-                pass
+                # Clean up temporary files for this specific file
+                for f in file_specific_temp_files:
+                    if os.path.exists(f):
+                        try:
+                            os.remove(f)
+                        except Exception as e:
+                            print(f"Could not remove temp file {f}: {e}")
 
         # Decide final status based on whether it was a reprint
         is_reprint = job_data.get("isReprint", False)
@@ -722,6 +771,12 @@ def process_print_job(job_id, job_data):
     finally:
         if word:
             word.Quit()
+        for f in temp_files_to_clean:
+            if os.path.exists(f):
+                try:
+                    os.remove(f)
+                except Exception as e:
+                    print(f"Could not remove temp file {f}: {e}")
 
         processed_jobs.discard(job_id)
         pythoncom.CoUninitialize()  # Uninitialize COM for this thread
@@ -740,7 +795,7 @@ def create_test_page_file(job_id, printer_name):
 def process_test_job(job_id, job_data):
     print(f"\n--- Processing test job {job_id} ---")
     job_ref = db.collection("print_jobs").document(job_id)
-    word = None
+    local_file_path, pdf_path, word = None, None, None
     try:
         pythoncom.CoInitialize()  # Initialize COM for this thread
         job_ref.update({"status": "printing"})
@@ -767,6 +822,10 @@ def process_test_job(job_id, job_data):
     finally:
         if word:
             word.Quit()
+        if local_file_path and os.path.exists(local_file_path):
+            os.remove(local_file_path)
+        if pdf_path and pdf_path != local_file_path and os.path.exists(pdf_path):
+            os.remove(pdf_path)
         processed_jobs.discard(job_id)
         pythoncom.CoUninitialize()  # Uninitialize COM for this thread
 
@@ -821,25 +880,31 @@ def main():
     print("--- PrintEx Local Connector ---")
     os.makedirs(TEMP_DIR, exist_ok=True)
 
+    if (
+        not TELEGRAM_BOT_TOKEN
+        or "YOUR_TELEGRAM_BOT_TOKEN" in TELEGRAM_BOT_TOKEN
+        or not TELEGRAM_CHAT_ID
+    ):
+        print(
+            "❌ Critical: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is not set in the script."
+        )
+        print(
+            "   Please edit the local_connector.py file and set the required credential variables."
+        )
+        sys.exit(1)
+    else:
+        print("✅ Telegram credentials loaded from script.")
+
     try:
         from PIL import Image
         import win32com.client
     except ImportError as e:
         print(
-            f"❌ Missing required library: {e.name}. Please run:\npip install Pillow pypiwin32 PyPDF2"
+            f"❌ Missing required library: {e.name}. Please run:\npip install Pillow pypiwin32 PyPDF2 requests"
         )
         sys.exit(1)
 
-    managed_printer_ids = update_printers_in_firestore()
-
-    print("🚀 Starting file receiver...")
-    receiver.init_receiver(
-        temp_dir=TEMP_DIR,
-        db_instance=db,
-        relay_url=RELAY_URL,
-        printer_ids=managed_printer_ids,
-        port=CONNECTOR_PORT,
-    )
+    update_printers_in_firestore()
 
     print("👂 Listening for jobs...")
     job_watch = start_job_listener()

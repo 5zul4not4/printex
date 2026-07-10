@@ -1,4 +1,4 @@
-# PrintEase Local Connector Agent (Python)
+# PrintEx Local Connector Agent (Python)
 
 This document provides instructions for setting up the Python-based Local Connector Agent, which runs on the print shop's Windows PC. This script is the bridge between your online application and your physical printers.
 
